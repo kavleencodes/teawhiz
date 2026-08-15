@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "TeaWhiz AI",
+  "version": "0.1.0",
+  "description": "Type a prompt and get instant AI responses",
+  "permissions": ["storage"],
+  "background": {
+    "service_worker": "src/background.ts",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "webwhiz ai",
+    "default_icon": {
+      "16": "public/icon.png",
+      "48": "public/icon.png",
+      "128": "public/icon.png"
+    }
+  },
+  "icons": {
+    "16": "public/icon.png",
+    "48": "public/icon.png",
+    "128": "public/icon.png"
+  }
+}

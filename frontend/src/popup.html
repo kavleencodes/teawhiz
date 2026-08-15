@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TeaWhiz AI</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #D85A3A;
+            --accent: #F5A442;
+            --bg: #ffffff;
+            --text: #1f2937;
+            --border: #e5e7eb;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #1f2937;
+                --text: #f3f4f6;
+                --border: #374151;
+            }
+        }
+
+        body {
+            width: 400px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+        }
+
+        .bar {
+            display: flex;
+            gap: 12px;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            align-items: flex-start;
+        }
+
+        .logo {
+            width: 32px;
+            height: 32px;
+            flex-shrink: 0;
+            margin-top: 8px;
+        }
+
+        .input-wrapper {
+            display: flex;
+            gap: 8px;
+            flex: 1;
+            align-items: flex-end;
+        }
+
+        textarea {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background-color: var(--bg);
+            color: var(--text);
+            font-size: 13px;
+            outline: none;
+            transition: border-color 0.2s;
+            resize: none;
+            font-family: inherit;
+            min-height: 36px;
+            max-height: 100px;
+            overflow-y: auto;
+        }
+
+        textarea:focus {
+            border-color: var(--primary);
+        }
+
+        textarea::placeholder {
+            color: #9ca3af;
+        }
+
+        button {
+            padding: 8px 14px;
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+            white-space: nowrap;
+        }
+
+        button:hover:not(:disabled) {
+            opacity: 0.9;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .response-area {
+            padding: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .response {
+            padding: 10px;
+            background-color: #f3f4f6;
+            border-left: 3px solid var(--primary);
+            border-radius: 4px;
+            font-size: 13px;
+            line-height: 1.5;
+            word-wrap: break-word;
+            margin-bottom: 8px;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .response {
+                background-color: #374151;
+            }
+        }
+
+        .error {
+            padding: 10px;
+            background-color: #fee2e4;
+            border-left: 3px solid #dc2626;
+            border-radius: 4px;
+            color: #991b1b;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .response-area::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .response-area::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Simple Bar -->
+    <div class="bar">
+        <img src="../public/icon.png" alt="TeaWhiz AI" class="logo">
+        <div class="input-wrapper">
+            <textarea
+                id="prompt"
+                placeholder="Ask something..."
+            ></textarea>
+            <button id="submit">Ask</button>
+        </div>
+    </div>
+
+    <!-- Response Area -->
+    <div class="response-area">
+        <div id="error" class="error hidden"></div>
+        <div id="response" class="response hidden"></div>
+    </div>
+
+    <script src="popup.ts" type="module"></script>
+</body>
+</html>
