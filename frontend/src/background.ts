@@ -7,61 +7,67 @@ interface MessageRequest {
   text: string;
 }
 
-// Check if Chrome Gemini Nano is available
-async function isNanoAvailable(): Promise<boolean> {
+// Stream answer from backend in real-time
+async function streamAnswer(text: string, tabId: number) {
   try {
-    const canCreate = await (window as any).ai?.canCreateTextSession?.();
-    return canCreate === "readily";
-  } catch {
-    return false;
-  }
-}
-
-// Get answer from Gemini Nano or backend
-async function getAnswer(text: string): Promise<string> {
-  const prompt = `Answer this question or request concisely:\n\n${text}`;
-
-  // Try Gemini Nano first
-  if (await isNanoAvailable()) {
-    try {
-      const session = await (window as any).ai.createTextSession();
-      const response = await session.prompt(prompt);
-      session.destroy();
-      return response;
-    } catch (error) {
-      console.log("Nano failed, falling back to backend:", error);
-    }
-  }
-
-  // Fallback to backend API
-  try {
-    const response = await fetch(`${BACKEND_URL}/explain`, {
+    const response = await fetch(`${BACKEND_URL}/explain-stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, action: "explain" }),
     });
 
-    if (!response.ok) throw new Error("Backend request failed");
-    const data = await response.json();
-    return data.answer;
+    if (!response.ok) {
+      chrome.tabs.sendMessage(tabId, {
+        type: "RESPONSE_ERROR",
+        error: "Backend error",
+      });
+      return;
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) return;
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        chrome.tabs.sendMessage(tabId, { type: "RESPONSE_DONE" });
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+
+      for (let i = 0; i < lines.length - 1; i++) {
+        const line = lines[i].trim();
+        if (line.startsWith("data: ")) {
+          const chunk = line.slice(6).trim();
+          if (chunk && chunk !== "[DONE]") {
+            chrome.tabs.sendMessage(tabId, {
+              type: "RESPONSE_CHUNK",
+              text: chunk + " ",
+            });
+          }
+        }
+      }
+      buffer = lines[lines.length - 1];
+    }
   } catch (error) {
-    throw new Error("Failed to connect to AI service");
+    chrome.tabs.sendMessage(tabId, {
+      type: "RESPONSE_ERROR",
+      error: String(error),
+    });
   }
 }
 
 // Handle messages from popup
 chrome.runtime.onMessage.addListener(
-  (request: MessageRequest, sender, sendResponse) => {
+  (request: MessageRequest, sender) => {
     if (request.type === "GET_ANSWER") {
-      getAnswer(request.text)
-        .then((answer) => {
-          sendResponse({ success: true, answer });
-        })
-        .catch((error) => {
-          sendResponse({ success: false, error: error.message });
-        });
-
-      // Return true to indicate async response
+      // Use streaming for real-time response
+      streamAnswer(request.text, sender.tab?.id || 0);
       return true;
     }
   }

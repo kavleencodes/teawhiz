@@ -1,0 +1,27 @@
+<!-- Animated TeaWhiz Logo -->
+<div style="text-align: center; padding: 20px;">
+  <img src="../public/icon.png" alt="TeaWhiz AI"
+       style="width: 100px; height: 100px;
+              animation: floatTeacup 2s ease-in-out infinite,
+                         glowEffect 2s ease-in-out infinite;">
+</div>
+
+<style>
+  @keyframes floatTeacup {
+    0%, 100% {
+      transform: translateY(0px);
+    }
+    50% {
+      transform: translateY(-10px);
+    }
+  }
+
+  @keyframes glowEffect {
+    0%, 100% {
+      filter: drop-shadow(0 0 5px rgba(245, 164, 66, 0.3));
+    }
+    50% {
+      filter: drop-shadow(0 0 15px rgba(245, 164, 66, 0.6));
+    }
+  }
+</style>

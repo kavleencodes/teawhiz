@@ -1,9 +1,40 @@
-// Simple popup script
+// Popup script - conversation-style messaging
 
 const promptInput = document.getElementById("prompt") as HTMLTextAreaElement;
 const submitBtn = document.getElementById("submit") as HTMLButtonElement;
-const responseDiv = document.getElementById("response") as HTMLDivElement;
-const errorDiv = document.getElementById("error") as HTMLDivElement;
+const clearBtn = document.getElementById("clearBtn") as HTMLButtonElement;
+const messagesContainer = document.getElementById("messagesContainer") as HTMLDivElement;
+const emptyState = document.getElementById("emptyState") as HTMLDivElement;
+
+let pageContent = "";
+const loadingWords = ["boiling", "brewing", "teaying", "sipping", "vibing"];
+let currentLoadingIndex = 0;
+let loadingInterval: any = null;
+let currentPrompt = "";
+let loadingMessageEl: HTMLElement | null = null;
+
+// Get page content when popup opens
+async function loadPageContent() {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tabs[0]?.id) {
+      chrome.tabs.sendMessage(
+        tabs[0].id,
+        { type: "GET_PAGE_CONTENT" },
+        (response) => {
+          if (response?.success) {
+            pageContent = response.content;
+            promptInput.placeholder = "Ask about this page...";
+          }
+        }
+      );
+    }
+  } catch (error) {
+    console.log("Could not load page content:", error);
+  }
+}
+
+loadPageContent();
 
 // Load saved prompt
 chrome.storage.local.get("savedPrompt", (result: any) => {
@@ -14,12 +45,18 @@ chrome.storage.local.get("savedPrompt", (result: any) => {
 
 // Auto-expand textarea and save
 promptInput.addEventListener("input", () => {
-  // Auto-expand
+  chrome.storage.local.set({ savedPrompt: promptInput.value });
   promptInput.style.height = "auto";
   promptInput.style.height = Math.min(promptInput.scrollHeight, 100) + "px";
+});
 
-  // Save
-  chrome.storage.local.set({ savedPrompt: promptInput.value });
+// Clear button
+clearBtn.addEventListener("click", () => {
+  promptInput.value = "";
+  messagesContainer.innerHTML = "";
+  emptyState.style.display = "flex";
+  chrome.storage.local.set({ savedPrompt: "" });
+  promptInput.focus();
 });
 
 // Submit on button click
@@ -34,44 +71,145 @@ promptInput.addEventListener("keydown", (e) => {
 });
 
 function submit() {
-  const prompt = promptInput.value.trim();
+  const userQuestion = promptInput.value.trim();
 
-  if (!prompt) {
-    showError("Please enter a prompt");
+  if (!userQuestion) {
+    showMessage(userQuestion, "user");
+    showMessage("Please type a question to ask about this page.", "error");
     return;
   }
 
+  currentPrompt = userQuestion;
+  showMessage(userQuestion, "user");
+
   submitBtn.disabled = true;
-  submitBtn.textContent = "Loading...";
-  responseDiv.classList.add("hidden");
-  errorDiv.classList.add("hidden");
+  submitBtn.textContent = "...";
+  emptyState.style.display = "none";
+
+  // Show loading animation
+  showLoading();
+
+  const fullPrompt = pageContent
+    ? `${pageContent}\n\n---\n\nUser Question: ${userQuestion}`
+    : userQuestion;
 
   chrome.runtime.sendMessage(
-    { type: "GET_ANSWER", text: prompt },
+    { type: "GET_ANSWER", text: fullPrompt },
     (response) => {
+      stopLoading();
       submitBtn.disabled = false;
-      submitBtn.textContent = "Ask";
+      submitBtn.textContent = "⬆";
 
       if (response?.success) {
-        showResponse(response.answer);
+        // Response will come as chunks
       } else {
-        showError(response?.error || "Failed to get response");
+        showMessage(response?.error || "Failed to get response", "error");
       }
     }
   );
 }
 
-function showResponse(answer: string) {
-  responseDiv.textContent = answer;
-  responseDiv.classList.remove("hidden");
-  errorDiv.classList.add("hidden");
+function showMessage(text: string, type: "user" | "assistant" | "error") {
+  const messageEl = document.createElement("div");
+  messageEl.className = `message ${type}`;
+
+  const contentEl = document.createElement("div");
+  contentEl.className = "message-content";
+  contentEl.textContent = text;
+
+  messageEl.appendChild(contentEl);
+  messagesContainer.appendChild(messageEl);
+
+  // Scroll to bottom
+  setTimeout(() => {
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  }, 0);
 }
 
-function showError(error: string) {
-  errorDiv.textContent = error;
-  errorDiv.classList.remove("hidden");
-  responseDiv.classList.add("hidden");
+function showLoading() {
+  // Create loading message with teacup icon
+  const messageEl = document.createElement("div");
+  messageEl.className = "message assistant";
+  messageEl.id = "loadingMessage";
+
+  const contentEl = document.createElement("div");
+  contentEl.className = "message-content loading-content";
+
+  // Add teacup icon
+  const iconEl = document.createElement("img");
+  iconEl.src = "../public/icon.png";
+  iconEl.className = "loading-icon";
+  iconEl.alt = "Loading";
+
+  // Add loading text
+  const textEl = document.createElement("span");
+  textEl.className = "loading-text-inline";
+  textEl.textContent = "Tea is boiling...";
+
+  contentEl.appendChild(iconEl);
+  contentEl.appendChild(textEl);
+  messageEl.appendChild(contentEl);
+  messagesContainer.appendChild(messageEl);
+
+  loadingMessageEl = messageEl;
+  currentLoadingIndex = 0;
+
+  loadingInterval = setInterval(() => {
+    const word = loadingWords[currentLoadingIndex % loadingWords.length];
+    if (textEl) {
+      textEl.textContent = `Tea is ${word}...`;
+    }
+    currentLoadingIndex++;
+  }, 600);
+
+  // Scroll to bottom
+  messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
+
+function stopLoading() {
+  if (loadingInterval) {
+    clearInterval(loadingInterval);
+    loadingInterval = null;
+  }
+  // Remove loading message
+  if (loadingMessageEl) {
+    loadingMessageEl.remove();
+    loadingMessageEl = null;
+  }
+}
+
+// Listen for streaming chunks from background
+chrome.runtime.onMessage.addListener((request) => {
+  if (request.type === "RESPONSE_CHUNK") {
+    stopLoading();
+    emptyState.style.display = "none";
+
+    // Get or create response message
+    let responseEl = messagesContainer.querySelector(".message.assistant:last-of-type .message-content");
+    if (!responseEl) {
+      const messageEl = document.createElement("div");
+      messageEl.className = "message assistant";
+      const contentEl = document.createElement("div");
+      contentEl.className = "message-content";
+      messageEl.appendChild(contentEl);
+      messagesContainer.appendChild(messageEl);
+      responseEl = contentEl;
+    }
+
+    // Add text chunk
+    responseEl.textContent += request.text;
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  } else if (request.type === "RESPONSE_DONE") {
+    stopLoading();
+    submitBtn.disabled = false;
+    submitBtn.textContent = "⬆";
+  } else if (request.type === "RESPONSE_ERROR") {
+    stopLoading();
+    showMessage(request.error, "error");
+    submitBtn.disabled = false;
+    submitBtn.textContent = "⬆";
+  }
+});
 
 promptInput.focus();
 console.log("TeaWhiz AI popup loaded");

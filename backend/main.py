@@ -6,6 +6,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from google import genai
@@ -211,6 +212,62 @@ async def explain(request: ExplainRequest):
     save_to_cache(cleaned_text, request.action, answer)
 
     return ExplainResponse(answer=answer, cached=False)
+
+@app.post("/explain-stream")
+async def explain_stream(request: ExplainRequest):
+    """Stream response word by word"""
+    cleaned_text = request.text.strip()
+    if not cleaned_text:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
+
+    if request.action not in ACTION_PROMPTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid action '{request.action}'. Supported: {', '.join(ACTION_PROMPTS.keys())}"
+        )
+
+    # Check cache
+    cached_answer, from_cache = get_from_cache(cleaned_text, request.action)
+    if from_cache:
+        # Stream cached response in word chunks (like Claude)
+        async def stream_cached():
+            words = cached_answer.split()
+            for i in range(0, len(words), 3):  # 3 words at a time
+                chunk = " ".join(words[i:i+3])
+                yield f"data: {chunk} \n\n"
+                await asyncio.sleep(0.1)  # Natural pause
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(stream_cached(), media_type="text/event-stream")
+
+    # Get response from Gemini and stream it
+    async def stream_response():
+        try:
+            template = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"])
+            prompt = template.format(text=cleaned_text)
+
+            # Get full response first
+            response = client.models.generate_content(
+                model="gemini-3.7-flash",
+                contents=prompt
+            )
+
+            full_response = response.text
+            save_to_cache(cleaned_text, request.action, full_response)
+
+            # Stream it in word chunks (like Claude)
+            words = full_response.split()
+            for i in range(0, len(words), 3):  # 3 words at a time
+                chunk = " ".join(words[i:i+3])
+                yield f"data: {chunk} \n\n"
+                await asyncio.sleep(0.1)  # Natural pause
+
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            print(f"❌ Stream error: {e}")
+            yield f"data: ERROR: {str(e)}\n\n"
+
+    return StreamingResponse(stream_response(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn
