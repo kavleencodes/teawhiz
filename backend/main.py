@@ -9,19 +9,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from google import genai
-from google.genai.errors import APIError
+from groq import Groq
+from groq import RateLimitError, APIError
 
 load_dotenv()
 
 app = FastAPI(
-    title="TeaWhiz AI API",
+    title="TeaWhiz AI",
     version="0.1.0"
 )
 
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,24 +28,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# Gemini Configuration & Async Client
-# ============================================================
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PRIMARY_MODEL = "gemini-3.7-flash"
-FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
-client: Optional[genai.Client] = None
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    print(f"✅ TeaWhiz AI - Gemini API configured (Primary: {PRIMARY_MODEL}, Fallback: {FALLBACK_MODEL})")
+GROQ_API_KEY = os.getenv("GROK_API_KEY")
+# Using groq/compound (fast, balanced quality)
+PRIMARY_MODEL = "groq/compound"
+FALLBACK_MODEL = "allam-2-7b"  # Fallback to faster model if needed
+
+client: Optional[Groq] = None
+if GROQ_API_KEY:
+    client = Groq(api_key=GROQ_API_KEY)
+    print(f"✅ TeaWhiz AI - Groq API configured (Primary: {PRIMARY_MODEL}, Fallback: {FALLBACK_MODEL})")
 else:
-    print("⚠️ WARNING: GEMINI_API_KEY not set in .env file")
+    print("⚠️ WARNING: GROK_API_KEY not set in .env file")
 
-# ============================================================
-# In-Memory Cache (UTC-aware & simple size guard)
-# ============================================================
+
 
 MAX_CACHE_ENTRIES = 5000
 response_cache: dict[str, dict] = {}
@@ -86,9 +80,7 @@ def save_to_cache(text: str, action: str, answer: str):
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
-# ============================================================
-# Request / Response Schemas
-# ============================================================
+
 
 class ExplainRequest(BaseModel):
     text: str
@@ -98,9 +90,7 @@ class ExplainResponse(BaseModel):
     answer: str
     cached: bool = False
 
-# ============================================================
-# Gemini Service with Exponential Backoff & Model Fallback
-# ============================================================
+
 
 ACTION_PROMPTS = {
     "explain": "Explain the following text in simple, clear terms without unnecessary repetition:\n\n{text}",
@@ -109,56 +99,58 @@ ACTION_PROMPTS = {
     "translate": "Translate the following text to Hindi. Return only the Hindi translation without explanation:\n\n{text}",
 }
 
-async def _call_gemini_with_retry(model_name: str, prompt: str, max_retries: int = 2) -> str:
-    """Invokes client.aio with exponential backoff on 503 / 429."""
+async def _call_groq_with_retry(model_name: str, prompt: str, max_retries: int = 2) -> str:
+    """Invokes Groq API with exponential backoff on rate limit errors."""
     for attempt in range(max_retries + 1):
         try:
-            # Native async generation via client.aio
-            response = await client.aio.models.generate_content(
+        
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
                 model=model_name,
-                contents=prompt
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=2048
             )
-            if not response.text:
+            if not response.choices or not response.choices[0].message.content:
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="Gemini returned an empty response"
+                    detail="Groq returned an empty response"
                 )
-            return response.text
-        except APIError as e:
-            # Check for transient server errors (503 Unavailable / 429 Rate Limit)
-            if e.code in (503, 429) and attempt < max_retries:
+            return response.choices[0].message.content
+        except RateLimitError as e:
+            
+            if attempt < max_retries:
                 delay = (2 ** attempt) + 0.5  # 1.5s, 2.5s
+                print(f"⚠️ Rate limited. Retrying in {delay}s...")
                 await asyncio.sleep(delay)
                 continue
             raise e
+        except APIError as e:
+            raise e
 
-async def get_gemini_response(text: str, action: str = "explain") -> str:
+async def get_groq_response(text: str, action: str = "explain") -> str:
     if not client:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="GEMINI_API_KEY is not configured on the server"
+            detail="GROK_API_KEY is not configured on the server"
         )
 
     template = ACTION_PROMPTS.get(action, ACTION_PROMPTS["explain"])
     prompt = template.format(text=text)
 
     try:
-        # Try Primary Model
-        return await _call_gemini_with_retry(PRIMARY_MODEL, prompt)
+        # Call Groq API with retry logic
+        return await _call_groq_with_retry(PRIMARY_MODEL, prompt)
+    except RateLimitError as e:
+        print(f"⚠️ Rate limit exceeded: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit reached. Please try again later."
+        )
     except APIError as e:
-        if e.code == 503:
-            print(f"⚠️ {PRIMARY_MODEL} overloaded (503). Retrying with fallback: {FALLBACK_MODEL}")
-            try:
-                # Failover to Fallback Model
-                return await _call_gemini_with_retry(FALLBACK_MODEL, prompt)
-            except Exception as fallback_err:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"Gemini capacity limit reached across primary and fallback models: {fallback_err}"
-                )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Gemini API error ({e.code}): {e.message}"
+            detail=f"Groq API error: {str(e)}"
         )
     except Exception as e:
         raise HTTPException(
@@ -166,17 +158,16 @@ async def get_gemini_response(text: str, action: str = "explain") -> str:
             detail=f"Unexpected error: {str(e)}"
         )
 
-# ============================================================
-# Routes
-# ============================================================
+
 
 @app.get("/")
 async def root():
     return {
-        "name": "TeaWhiz AI API",
+        "name": "TeaWhiz AI API (Groq)",
         "version": "0.1.0",
         "docs": "/docs",
         "health": "/health",
+        "model": PRIMARY_MODEL,
         "endpoints": {"POST /explain": "Explain, simplify, summarize, or translate text"}
     }
 
@@ -184,8 +175,8 @@ async def root():
 async def health_check():
     return {
         "status": "ok",
-        "service": "TeaWhiz AI API",
-        "gemini_ready": client is not None
+        "service": "TeaWhiz AI API (Groq)",
+        "groq_ready": client is not None
     }
 
 @app.post("/explain", response_model=ExplainResponse)
@@ -206,7 +197,7 @@ async def explain(request: ExplainRequest):
         return ExplainResponse(answer=cached_answer, cached=True)
 
     # Generate response
-    answer = await get_gemini_response(cleaned_text, request.action)
+    answer = await get_groq_response(cleaned_text, request.action)
 
     # Save to cache
     save_to_cache(cleaned_text, request.action, answer)
@@ -239,19 +230,22 @@ async def explain_stream(request: ExplainRequest):
             yield "data: [DONE]\n\n"
         return StreamingResponse(stream_cached(), media_type="text/event-stream")
 
-    # Get response from Gemini and stream it
+    # Get response from Groq and stream it
     async def stream_response():
         try:
             template = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"])
             prompt = template.format(text=cleaned_text)
 
-            # Get full response first
-            response = client.models.generate_content(
-                model="gemini-3.7-flash",
-                contents=prompt
+            # Get full response from Groq
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=PRIMARY_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=2048
             )
 
-            full_response = response.text
+            full_response = response.choices[0].message.content
             save_to_cache(cleaned_text, request.action, full_response)
 
             # Stream it in word chunks (like Claude)

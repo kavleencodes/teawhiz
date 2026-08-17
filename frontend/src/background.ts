@@ -33,7 +33,7 @@ async function streamAnswer(text: string, tabId: number) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        chrome.tabs.sendMessage(tabId, { type: "RESPONSE_DONE" });
+        chrome.runtime.sendMessage({ type: "RESPONSE_DONE" });
         break;
       }
 
@@ -45,7 +45,7 @@ async function streamAnswer(text: string, tabId: number) {
         if (line.startsWith("data: ")) {
           const chunk = line.slice(6).trim();
           if (chunk && chunk !== "[DONE]") {
-            chrome.tabs.sendMessage(tabId, {
+            chrome.runtime.sendMessage({
               type: "RESPONSE_CHUNK",
               text: chunk + " ",
             });
@@ -55,7 +55,7 @@ async function streamAnswer(text: string, tabId: number) {
       buffer = lines[lines.length - 1];
     }
   } catch (error) {
-    chrome.tabs.sendMessage(tabId, {
+    chrome.runtime.sendMessage({
       type: "RESPONSE_ERROR",
       error: String(error),
     });

@@ -10,8 +10,9 @@ let pageContent = "";
 const loadingWords = ["boiling", "brewing", "teaying", "sipping", "vibing"];
 let currentLoadingIndex = 0;
 let loadingInterval: any = null;
-let currentPrompt = "";
 let loadingMessageEl: HTMLElement | null = null;
+let loadingStartTime = 0;
+const LOADING_DURATION = 5000; // 5 seconds before showing response
 
 // Get page content when popup opens
 async function loadPageContent() {
@@ -79,7 +80,6 @@ function submit() {
     return;
   }
 
-  currentPrompt = userQuestion;
   showMessage(userQuestion, "user");
 
   submitBtn.disabled = true;
@@ -153,6 +153,7 @@ function showLoading() {
 
   loadingMessageEl = messageEl;
   currentLoadingIndex = 0;
+  loadingStartTime = Date.now(); // Track when loading started
 
   loadingInterval = setInterval(() => {
     const word = loadingWords[currentLoadingIndex % loadingWords.length];
@@ -181,24 +182,30 @@ function stopLoading() {
 // Listen for streaming chunks from background
 chrome.runtime.onMessage.addListener((request) => {
   if (request.type === "RESPONSE_CHUNK") {
-    stopLoading();
-    emptyState.style.display = "none";
+    // Wait 5 seconds before showing actual response chunks
+    const elapsedTime = Date.now() - loadingStartTime;
+    const remainingTime = Math.max(0, LOADING_DURATION - elapsedTime);
 
-    // Get or create response message
-    let responseEl = messagesContainer.querySelector(".message.assistant:last-of-type .message-content");
-    if (!responseEl) {
-      const messageEl = document.createElement("div");
-      messageEl.className = "message assistant";
-      const contentEl = document.createElement("div");
-      contentEl.className = "message-content";
-      messageEl.appendChild(contentEl);
-      messagesContainer.appendChild(messageEl);
-      responseEl = contentEl;
-    }
+    setTimeout(() => {
+      stopLoading();
+      emptyState.style.display = "none";
 
-    // Add text chunk
-    responseEl.textContent += request.text;
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      // Get or create response message
+      let responseEl = messagesContainer.querySelector(".message.assistant:last-of-type .message-content");
+      if (!responseEl) {
+        const messageEl = document.createElement("div");
+        messageEl.className = "message assistant";
+        const contentEl = document.createElement("div");
+        contentEl.className = "message-content";
+        messageEl.appendChild(contentEl);
+        messagesContainer.appendChild(messageEl);
+        responseEl = contentEl;
+      }
+
+      // Add text chunk
+      responseEl.textContent += request.text;
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }, remainingTime);
   } else if (request.type === "RESPONSE_DONE") {
     stopLoading();
     submitBtn.disabled = false;
