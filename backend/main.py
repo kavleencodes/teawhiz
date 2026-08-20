@@ -31,8 +31,8 @@ app.add_middleware(
 
 
 GROQ_API_KEY = os.getenv("GROK_API_KEY")
-# Using groq/compound (fast, balanced quality)
-PRIMARY_MODEL = "groq/compound"
+# Using openai/gpt-oss-120b (high quality, better for analysis)
+PRIMARY_MODEL = "openai/gpt-oss-120b"
 FALLBACK_MODEL = "allam-2-7b"  # Fallback to faster model if needed
 
 client: Optional[Groq] = None
@@ -93,9 +93,9 @@ class ExplainResponse(BaseModel):
 
 
 ACTION_PROMPTS = {
-    "explain": "Explain the following text in simple, clear terms without unnecessary repetition:\n\n{text}",
-    "simplify": "Rewrite the following text in simpler language while preserving the original meaning:\n\n{text}",
-    "summarize": "Summarize the following text in 2-3 concise sentences:\n\n{text}",
+    "explain": "Analyze and explain the following webpage content in clear, concise terms. Focus on the main points and key information. Avoid repetition and be direct:\n\n{text}",
+    "simplify": "Rewrite the following text in simpler language while preserving the original meaning and all key details:\n\n{text}",
+    "summarize": "Provide a 2-3 sentence summary of the main points from this webpage content:\n\n{text}",
     "translate": "Translate the following text to Hindi. Return only the Hindi translation without explanation:\n\n{text}",
 }
 
