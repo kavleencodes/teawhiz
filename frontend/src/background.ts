@@ -17,7 +17,7 @@ async function streamAnswer(text: string, tabId: number) {
     });
 
     if (!response.ok) {
-      chrome.tabs.sendMessage(tabId, {
+      sendToTab(tabId, {
         type: "RESPONSE_ERROR",
         error: "Backend error",
       });
@@ -33,7 +33,7 @@ async function streamAnswer(text: string, tabId: number) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        chrome.runtime.sendMessage({ type: "RESPONSE_DONE" });
+        sendToTab(tabId, { type: "RESPONSE_DONE" });
         break;
       }
 
@@ -45,7 +45,7 @@ async function streamAnswer(text: string, tabId: number) {
         if (line.startsWith("data: ")) {
           const chunk = line.slice(6).trim();
           if (chunk && chunk !== "[DONE]") {
-            chrome.runtime.sendMessage({
+            sendToTab(tabId, {
               type: "RESPONSE_CHUNK",
               text: chunk + " ",
             });
@@ -55,11 +55,20 @@ async function streamAnswer(text: string, tabId: number) {
       buffer = lines[lines.length - 1];
     }
   } catch (error) {
-    chrome.runtime.sendMessage({
+    sendToTab(tabId, {
       type: "RESPONSE_ERROR",
       error: String(error),
     });
   }
+}
+
+// Safe message sending with error handling
+function sendToTab(tabId: number, message: any) {
+  if (!tabId) return;
+  chrome.tabs.sendMessage(tabId, message).catch(() => {
+    // Silently ignore if tab is closed or not responding
+    console.log("Could not send message to tab", tabId);
+  });
 }
 
 // Handle messages from popup
