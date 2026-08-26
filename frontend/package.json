@@ -13,5 +13,8 @@
     "@types/chrome": "^0.2.6",
     "typescript": "~6.0.2",
     "vite": "^8.2.0"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0"
   }
 }

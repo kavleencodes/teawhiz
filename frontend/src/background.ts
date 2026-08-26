@@ -10,30 +10,41 @@ interface MessageRequest {
 // Stream answer from backend in real-time
 async function streamAnswer(text: string, tabId: number) {
   try {
+    console.log("[TeaWhiz] Background: Fetching from", `${BACKEND_URL}/explain-stream`);
+
     const response = await fetch(`${BACKEND_URL}/explain-stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, action: "explain" }),
     });
 
+    console.log("[TeaWhiz] Background: Got response status:", response.status);
+
     if (!response.ok) {
-      sendToTab(tabId, {
+      console.error("[TeaWhiz] Background: Backend error", response.status);
+      broadcastResponse({
         type: "RESPONSE_ERROR",
-        error: "Backend error",
+        error: `Backend error: ${response.status}`,
       });
       return;
     }
 
     const reader = response.body?.getReader();
-    if (!reader) return;
+    if (!reader) {
+      console.error("[TeaWhiz] Background: No reader available");
+      return;
+    }
 
+    console.log("[TeaWhiz] Background: Starting to read stream");
     const decoder = new TextDecoder();
     let buffer = "";
+    let chunkCount = 0;
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        sendToTab(tabId, { type: "RESPONSE_DONE" });
+        console.log("[TeaWhiz] Background: Stream done, sent", chunkCount, "chunks");
+        broadcastResponse({ type: "RESPONSE_DONE" });
         break;
       }
 
@@ -45,36 +56,40 @@ async function streamAnswer(text: string, tabId: number) {
         if (line.startsWith("data: ")) {
           const chunk = line.slice(6).trim();
           if (chunk && chunk !== "[DONE]") {
-            sendToTab(tabId, {
+            console.log("[TeaWhiz] Background: Sending chunk:", chunk);
+            broadcastResponse({
               type: "RESPONSE_CHUNK",
               text: chunk + " ",
             });
+            chunkCount++;
           }
         }
       }
       buffer = lines[lines.length - 1];
     }
   } catch (error) {
-    sendToTab(tabId, {
+    console.error("[TeaWhiz] Background: Stream error:", error);
+    broadcastResponse({
       type: "RESPONSE_ERROR",
       error: String(error),
     });
   }
 }
 
-// Safe message sending with error handling
-function sendToTab(tabId: number, message: any) {
-  if (!tabId) return;
-  chrome.tabs.sendMessage(tabId, message).catch(() => {
-    // Silently ignore if tab is closed or not responding
-    console.log("Could not send message to tab", tabId);
+// Broadcast response to all listeners (popup will receive it)
+function broadcastResponse(message: any) {
+  chrome.runtime.sendMessage(message).catch(() => {
+    // Silently ignore if no listener
+    console.log("Broadcast sent:", message.type);
   });
 }
 
 // Handle messages from popup
 chrome.runtime.onMessage.addListener(
   (request: MessageRequest, sender) => {
+    console.log("[TeaWhiz] Background: Received message:", request.type);
     if (request.type === "GET_ANSWER") {
+      console.log("[TeaWhiz] Background: Starting stream for text of length:", request.text.length);
       // Use streaming for real-time response
       streamAnswer(request.text, sender.tab?.id || 0);
       return true;

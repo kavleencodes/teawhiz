@@ -12,26 +12,33 @@ let currentLoadingIndex = 0;
 let loadingInterval: any = null;
 let loadingMessageEl: HTMLElement | null = null;
 let loadingStartTime = 0;
+let hasStoppedLoading = false; // Track if we've already stopped loading
 const LOADING_DURATION = 5000; // 5 seconds before showing response
 
 // Get page content when popup opens
 async function loadPageContent() {
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    console.log("[TeaWhiz] Popup: Querying active tab...", tabs[0]?.id);
+
     if (tabs[0]?.id) {
       chrome.tabs.sendMessage(
         tabs[0].id,
         { type: "GET_PAGE_CONTENT" },
         (response) => {
+          console.log("[TeaWhiz] Popup: Got content response:", response);
           if (response?.success) {
             pageContent = response.content;
             promptInput.placeholder = "Ask about this page...";
+            console.log("[TeaWhiz] Popup: Page content loaded, length:", pageContent.length);
+          } else {
+            console.log("[TeaWhiz] Popup: Content request failed", response);
           }
         }
       );
     }
   } catch (error) {
-    console.log("Could not load page content:", error);
+    console.log("[TeaWhiz] Popup: Could not load page content:", error);
   }
 }
 
@@ -80,6 +87,13 @@ function submit() {
     return;
   }
 
+  console.log("[TeaWhiz] Popup: Submit button clicked, clearing previous response");
+  // Clear the response content ID when submitting new question
+  const oldResponse = document.getElementById("responseContent");
+  if (oldResponse) {
+    oldResponse.parentElement?.remove();
+  }
+
   showMessage(userQuestion, "user");
 
   submitBtn.disabled = true;
@@ -93,9 +107,16 @@ function submit() {
     ? `${pageContent}\n\n---\n\nUser Question: ${userQuestion}`
     : userQuestion;
 
+  console.log("[TeaWhiz] Popup: Sending GET_ANSWER to background", {
+    hasPageContent: !!pageContent,
+    pageContentLength: pageContent.length,
+    userQuestion: userQuestion,
+  });
+
   chrome.runtime.sendMessage(
     { type: "GET_ANSWER", text: fullPrompt },
     (response) => {
+      console.log("[TeaWhiz] Popup: Got callback response:", response);
       stopLoading();
       submitBtn.disabled = false;
       submitBtn.textContent = "⬆";
@@ -174,43 +195,67 @@ function stopLoading() {
   }
   // Remove loading message
   if (loadingMessageEl) {
+    console.log("[TeaWhiz] Popup: Removing loading message element");
     loadingMessageEl.remove();
     loadingMessageEl = null;
   }
+  hasStoppedLoading = true;
 }
 
 // Listen for streaming chunks from background
 chrome.runtime.onMessage.addListener((request) => {
-  if (request.type === "RESPONSE_CHUNK") {
-    // Wait 5 seconds before showing actual response chunks
-    const elapsedTime = Date.now() - loadingStartTime;
-    const remainingTime = Math.max(0, LOADING_DURATION - elapsedTime);
+  console.log("[TeaWhiz] Popup: Received message:", request.type);
 
-    setTimeout(() => {
-      stopLoading();
+  if (request.type === "RESPONSE_CHUNK") {
+    console.log("[TeaWhiz] Popup: Got chunk:", request.text);
+
+    const displayChunk = () => {
+      // Stop loading only once
+      if (!hasStoppedLoading) {
+        console.log("[TeaWhiz] Popup: Stopping loading animation");
+        stopLoading();
+      }
+
       emptyState.style.display = "none";
 
-      // Get or create response message
-      let responseEl = messagesContainer.querySelector(".message.assistant:last-of-type .message-content");
+      // Get or create response message - use a stable ID
+      let responseEl = document.getElementById("responseContent");
       if (!responseEl) {
+        console.log("[TeaWhiz] Popup: Creating new response message element");
         const messageEl = document.createElement("div");
         messageEl.className = "message assistant";
         const contentEl = document.createElement("div");
         contentEl.className = "message-content";
+        contentEl.id = "responseContent";
         messageEl.appendChild(contentEl);
         messagesContainer.appendChild(messageEl);
         responseEl = contentEl;
       }
 
       // Add text chunk
+      console.log("[TeaWhiz] Popup: Appending chunk to response element, current text length:", responseEl.textContent.length);
       responseEl.textContent += request.text;
+      console.log("[TeaWhiz] Popup: After chunk, text length:", responseEl.textContent.length, "content preview:", responseEl.textContent.substring(0, 50));
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
-    }, remainingTime);
+    };
+
+    // Only delay first chunk by remaining 5-second duration
+    if (!hasStoppedLoading) {
+      const elapsedTime = Date.now() - loadingStartTime;
+      const remainingTime = Math.max(0, LOADING_DURATION - elapsedTime);
+      console.log("[TeaWhiz] Popup: Delaying first chunk by", remainingTime, "ms");
+      setTimeout(displayChunk, remainingTime);
+    } else {
+      // Display subsequent chunks immediately
+      displayChunk();
+    }
   } else if (request.type === "RESPONSE_DONE") {
+    console.log("[TeaWhiz] Popup: Response complete");
     stopLoading();
     submitBtn.disabled = false;
     submitBtn.textContent = "⬆";
   } else if (request.type === "RESPONSE_ERROR") {
+    console.log("[TeaWhiz] Popup: Got error:", request.error);
     stopLoading();
     showMessage(request.error, "error");
     submitBtn.disabled = false;

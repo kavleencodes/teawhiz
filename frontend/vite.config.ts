@@ -7,8 +7,13 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
+    target: 'ES2020',
   },
   server: {
     hmr: false,
+    middlewareMode: false,
+  },
+  preview: {
+    port: 5173,
   },
 })

@@ -1,40 +1,105 @@
 
+import { Readability } from "@mozilla/readability";
 
-const MAX_CONTENT_LENGTH = 8000; 
+const MAX_CONTENT_LENGTH = 8000;
+
+function cleanText(text: string): string {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/\n\s*\n/g, "\n")
+    .trim();
+}
+
+function extractWithReadability(): string {
+  try {
+    console.log("[TeaWhiz] 1. Starting Readability extraction");
+
+    // Pass the REAL document, not a clone - Readability needs real DOM
+    const reader = new Readability(document);
+    console.log("[TeaWhiz] 2. Readability instance created");
+
+    const article = reader.parse();
+    console.log("[TeaWhiz] 3. Readability parsed. Article:", article);
+
+    if (article && article.textContent) {
+      console.log("[TeaWhiz] 4. Article content found, length:", article.textContent.length);
+      return cleanText(article.textContent);
+    } else {
+      console.warn("[TeaWhiz] 4. No article content returned from Readability");
+      return "";
+    }
+  } catch (error) {
+    console.error("[TeaWhiz] ❌ Readability extraction failed:", error);
+    return "";
+  }
+}
+
+function extractFallback(): string {
+  try {
+    const contentSelectors = [
+      "article",
+      "main",
+      "[role='main']",
+      ".main-content",
+      ".article-content",
+      ".post-content",
+      ".entry-content",
+    ];
+
+    for (const selector of contentSelectors) {
+      const element = document.querySelector(selector) as HTMLElement | null;
+      if (element) {
+        const text = element.innerText || element.textContent || "";
+        if (text.length > 100) {
+          console.log(`[TeaWhiz] Found content in selector: ${selector}`);
+          return cleanText(text);
+        }
+      }
+    }
+
+    // Last resort: body text
+    const bodyText = document.body.innerText || "";
+    console.log("[TeaWhiz] Using body text, length:", bodyText.length);
+    return cleanText(bodyText);
+  } catch (error) {
+    console.error("[TeaWhiz] Fallback extraction error:", error);
+    return "";
+  }
+}
 
 function getPageContent(): string {
-  // Get page title
   const title = document.title || "No title";
 
+  // Try Readability first
+  let textContent = extractWithReadability();
 
-  const mainContent = Array.from(
-    document.querySelectorAll("p, h1, h2, h3, h4, li, article, main, .content")
-  )
-    .map((el) => el.textContent?.trim())
-    .filter((text) => text && text.length > 0)
-    .join("\n");
-
-  
-  const textContent = mainContent || document.body.innerText || "";
+  // If Readability fails, use fallback
+  if (!textContent || textContent.length < 100) {
+    console.log("[TeaWhiz] Readability returned insufficient content, using fallback");
+    textContent = extractFallback();
+  }
 
   const limitedContent = textContent.substring(0, MAX_CONTENT_LENGTH);
 
-  
   if (textContent.length > MAX_CONTENT_LENGTH) {
-    console.warn(
-      `[TeaWhiz] Page content truncated from ${textContent.length} to ${MAX_CONTENT_LENGTH} characters`
+    console.log(
+      `[TeaWhiz] Content truncated from ${textContent.length} to ${MAX_CONTENT_LENGTH} chars`
     );
   }
 
   return `Page Title: ${title}\n\nContent:\n${limitedContent}`;
 }
 
-
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "GET_PAGE_CONTENT") {
-    const pageContent = getPageContent();
-    sendResponse({ success: true, content: pageContent });
+    try {
+      const pageContent = getPageContent();
+      sendResponse({ success: true, content: pageContent });
+    } catch (error) {
+      console.error("[TeaWhiz] Message handler error:", error);
+      sendResponse({ success: false, error: String(error) });
+    }
   }
 });
 
-console.log("TeaWhiz AI content script loaded");
+console.log("[TeaWhiz] Content script loaded - Readability enabled with debugging");
