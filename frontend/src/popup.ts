@@ -1,5 +1,8 @@
 // Popup script - conversation-style messaging
 
+// Declare marked global (loaded from CDN in popup.html)
+declare const marked: any;
+
 const promptInput = document.getElementById("prompt") as HTMLTextAreaElement;
 const submitBtn = document.getElementById("submit") as HTMLButtonElement;
 const clearBtn = document.getElementById("clearBtn") as HTMLButtonElement;
@@ -11,9 +14,7 @@ const loadingWords = ["boiling", "brewing", "teaying", "sipping", "vibing"];
 let currentLoadingIndex = 0;
 let loadingInterval: any = null;
 let loadingMessageEl: HTMLElement | null = null;
-let loadingStartTime = 0;
 let hasStoppedLoading = false; // Track if we've already stopped loading
-const LOADING_DURATION = 5000; // 5 seconds before showing response
 
 // Get page content when popup opens
 async function loadPageContent() {
@@ -43,6 +44,18 @@ async function loadPageContent() {
 }
 
 loadPageContent();
+
+// Markdown rendering function
+function renderMarkdown(text: string): string {
+  try {
+    // Use marked library to convert markdown to HTML
+    return (marked as any).parse(text);
+  } catch (error) {
+    console.error("[TeaWhiz] Markdown rendering error:", error);
+    // Fallback to plain text if markdown fails
+    return `<p>${text.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>`;
+  }
+}
 
 // Load saved prompt
 chrome.storage.local.get("savedPrompt", (result: any) => {
@@ -136,7 +149,13 @@ function showMessage(text: string, type: "user" | "assistant" | "error") {
 
   const contentEl = document.createElement("div");
   contentEl.className = "message-content";
-  contentEl.textContent = text;
+
+  // Render markdown for assistant and error messages, plain text for user
+  if (type === "assistant") {
+    contentEl.innerHTML = renderMarkdown(text);
+  } else {
+    contentEl.textContent = text;
+  }
 
   messageEl.appendChild(contentEl);
   messagesContainer.appendChild(messageEl);
@@ -174,7 +193,6 @@ function showLoading() {
 
   loadingMessageEl = messageEl;
   currentLoadingIndex = 0;
-  loadingStartTime = Date.now(); // Track when loading started
 
   loadingInterval = setInterval(() => {
     const word = loadingWords[currentLoadingIndex % loadingWords.length];
@@ -219,7 +237,7 @@ chrome.runtime.onMessage.addListener((request) => {
       emptyState.style.display = "none";
 
       // Get or create response message - use a stable ID
-      let responseEl = document.getElementById("responseContent");
+      let responseEl = document.getElementById("responseContent") as HTMLElement | null;
       if (!responseEl) {
         console.log("[TeaWhiz] Popup: Creating new response message element");
         const messageEl = document.createElement("div");
@@ -227,28 +245,27 @@ chrome.runtime.onMessage.addListener((request) => {
         const contentEl = document.createElement("div");
         contentEl.className = "message-content";
         contentEl.id = "responseContent";
+        contentEl.setAttribute("data-raw-text", "");
         messageEl.appendChild(contentEl);
         messagesContainer.appendChild(messageEl);
         responseEl = contentEl;
       }
 
-      // Add text chunk
-      console.log("[TeaWhiz] Popup: Appending chunk to response element, current text length:", responseEl.textContent.length);
-      responseEl.textContent += request.text;
-      console.log("[TeaWhiz] Popup: After chunk, text length:", responseEl.textContent.length, "content preview:", responseEl.textContent.substring(0, 50));
+      // Get accumulated text and add new chunk
+      let fullText = responseEl.getAttribute("data-raw-text") || "";
+      fullText += request.text;
+      console.log("[TeaWhiz] Popup: Accumulated text length:", fullText.length);
+
+      // Store raw text and render markdown
+      responseEl.setAttribute("data-raw-text", fullText);
+      responseEl.innerHTML = renderMarkdown(fullText);
+      console.log("[TeaWhiz] Popup: Rendered markdown, preview:", fullText.substring(0, 50));
+
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
     };
 
-    // Only delay first chunk by remaining 5-second duration
-    if (!hasStoppedLoading) {
-      const elapsedTime = Date.now() - loadingStartTime;
-      const remainingTime = Math.max(0, LOADING_DURATION - elapsedTime);
-      console.log("[TeaWhiz] Popup: Delaying first chunk by", remainingTime, "ms");
-      setTimeout(displayChunk, remainingTime);
-    } else {
-      // Display subsequent chunks immediately
-      displayChunk();
-    }
+    // Display chunks immediately (no delay)
+    displayChunk();
   } else if (request.type === "RESPONSE_DONE") {
     console.log("[TeaWhiz] Popup: Response complete");
     stopLoading();

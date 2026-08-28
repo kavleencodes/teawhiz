@@ -223,10 +223,10 @@ async def explain_stream(request: ExplainRequest):
         # Stream cached response in word chunks (like Claude)
         async def stream_cached():
             words = cached_answer.split()
-            for i in range(0, len(words), 3):  # 3 words at a time
-                chunk = " ".join(words[i:i+3])
+            for i in range(0, len(words), 15):  # 15 words at a time for better sentence alignment
+                chunk = " ".join(words[i:i+15])
                 yield f"data: {chunk} \n\n"
-                await asyncio.sleep(0.1)  # Natural pause
+                await asyncio.sleep(0.05)  # Shorter pause for smooth flow
             yield "data: [DONE]\n\n"
         return StreamingResponse(stream_cached(), media_type="text/event-stream")
 
@@ -250,10 +250,10 @@ async def explain_stream(request: ExplainRequest):
 
             # Stream it in word chunks (like Claude)
             words = full_response.split()
-            for i in range(0, len(words), 3):  # 3 words at a time
-                chunk = " ".join(words[i:i+3])
+            for i in range(0, len(words), 15):  # 15 words at a time for better sentence alignment
+                chunk = " ".join(words[i:i+15])
                 yield f"data: {chunk} \n\n"
-                await asyncio.sleep(0.1)  # Natural pause
+                await asyncio.sleep(0.05)  # Shorter pause for smooth flow
 
             yield "data: [DONE]\n\n"
 

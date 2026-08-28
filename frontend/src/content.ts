@@ -1,9 +1,13 @@
 const MAX_CONTENT_LENGTH = 8000;
 
+// Markdown-preserving text cleaning
+// Only collapses spaces/tabs, preserves newlines and markdown syntax (|, **, etc.)
 function cleanText(text: string): string {
   return text
-    .replace(/\s+/g, " ")
-    .replace(/\n\s*\n/g, "\n")
+    .replace(/[ \t]+/g, " ")        // Collapse multiple spaces/tabs only
+    .replace(/\n[ \t]+/g, "\n")     // Remove leading spaces on lines
+    .replace(/[ \t]+\n/g, "\n")     // Remove trailing spaces on lines
+    .replace(/\n{3,}/g, "\n\n")     // Normalize multiple newlines to double
     .trim();
 }
 

@@ -327,6 +327,116 @@
             background: #c44829;
             box-shadow: 0 2px 8px rgba(216, 90, 58, 0.3);
         }
+
+        /* Markdown rendering styles */
+        .message-content h1,
+        .message-content h2,
+        .message-content h3,
+        .message-content h4,
+        .message-content h5,
+        .message-content h6 {
+            margin-top: 12px;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+
+        .message-content h1 { font-size: 18px; }
+        .message-content h2 { font-size: 16px; }
+        .message-content h3 { font-size: 14px; }
+
+        .message-content p {
+            margin-bottom: 8px;
+            line-height: 1.6;
+        }
+
+        .message-content ul,
+        .message-content ol {
+            margin-left: 16px;
+            margin-bottom: 8px;
+        }
+
+        .message-content li {
+            margin-bottom: 4px;
+            line-height: 1.5;
+        }
+
+        .message-content code {
+            background: rgba(0, 0, 0, 0.1);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: "Monaco", "Courier New", monospace;
+            font-size: 12px;
+            color: var(--primary);
+        }
+
+        .message-content pre {
+            background: rgba(0, 0, 0, 0.05);
+            border-left: 3px solid var(--primary);
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            margin: 8px 0;
+            font-size: 12px;
+        }
+
+        .message-content pre code {
+            background: transparent;
+            padding: 0;
+            color: inherit;
+        }
+
+        .message-content blockquote {
+            border-left: 3px solid var(--primary);
+            padding-left: 12px;
+            margin-left: 0;
+            margin-bottom: 8px;
+            color: var(--text-light);
+            font-style: italic;
+        }
+
+        .message-content table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 8px 0;
+            font-size: 13px;
+        }
+
+        .message-content table th,
+        .message-content table td {
+            border: 1px solid var(--border);
+            padding: 8px;
+            text-align: left;
+        }
+
+        .message-content table th {
+            background: var(--surface);
+            font-weight: 600;
+            color: var(--primary);
+        }
+
+        .message-content table tr:nth-child(even) {
+            background: rgba(0, 0, 0, 0.02);
+        }
+
+        .message-content strong {
+            font-weight: 600;
+            color: var(--primary);
+        }
+
+        .message-content em {
+            font-style: italic;
+        }
+
+        .message-content a {
+            color: var(--primary);
+            text-decoration: underline;
+        }
+
+        .message-content hr {
+            border: none;
+            border-top: 1px solid var(--border);
+            margin: 12px 0;
+        }
     </style>
 </head>
 <body>
@@ -367,6 +477,8 @@
         </div>
     </div>
 
+    <!-- Markdown parser for rendering responses -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/13.0.3/marked.min.js"></script>
     <script src="popup.ts" type="module"></script>
 </body>
 </html>
