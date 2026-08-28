@@ -1,6 +1,3 @@
-
-import { Readability } from "@mozilla/readability";
-
 const MAX_CONTENT_LENGTH = 8000;
 
 function cleanText(text: string): string {
@@ -8,30 +5,6 @@ function cleanText(text: string): string {
     .replace(/\s+/g, " ")
     .replace(/\n\s*\n/g, "\n")
     .trim();
-}
-
-function extractWithReadability(): string {
-  try {
-    console.log("[TeaWhiz] 1. Starting Readability extraction");
-
-    // Pass the REAL document, not a clone - Readability needs real DOM
-    const reader = new Readability(document);
-    console.log("[TeaWhiz] 2. Readability instance created");
-
-    const article = reader.parse();
-    console.log("[TeaWhiz] 3. Readability parsed. Article:", article);
-
-    if (article && article.textContent) {
-      console.log("[TeaWhiz] 4. Article content found, length:", article.textContent.length);
-      return cleanText(article.textContent);
-    } else {
-      console.warn("[TeaWhiz] 4. No article content returned from Readability");
-      return "";
-    }
-  } catch (error) {
-    console.error("[TeaWhiz] ❌ Readability extraction failed:", error);
-    return "";
-  }
 }
 
 function extractFallback(): string {
@@ -70,14 +43,9 @@ function extractFallback(): string {
 function getPageContent(): string {
   const title = document.title || "No title";
 
-  // Try Readability first
-  let textContent = extractWithReadability();
-
-  // If Readability fails, use fallback
-  if (!textContent || textContent.length < 100) {
-    console.log("[TeaWhiz] Readability returned insufficient content, using fallback");
-    textContent = extractFallback();
-  }
+  // TEMP: Skip Readability to prevent page distortion, use fallback directly
+  console.log("[TeaWhiz] Using fallback extraction to prevent page distortion");
+  let textContent = extractFallback();
 
   const limitedContent = textContent.substring(0, MAX_CONTENT_LENGTH);
 
