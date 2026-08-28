@@ -10,7 +10,11 @@ export default defineConfig({
     target: 'ES2020',
   },
   server: {
-    hmr: false,
+    hmr: {
+      host: 'localhost',
+      port: 5173,
+      protocol: 'ws'
+    },
     middlewareMode: false,
   },
   preview: {

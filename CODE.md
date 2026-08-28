@@ -1,1363 +1,606 @@
-# webwhiz ai — Complete Development Guide
+# TeaWhiz AI — Complete Implementation Guide
 
-**From zero to Chrome Web Store deployment — all phases in one guide**
+**Chrome Extension + FastAPI Backend — Full Architecture & Implementation Details**
 
 ---
 
-## Table of Contents
+## 📋 Table of Contents
 
 1. [Project Overview](#project-overview)
 2. [Tech Stack](#tech-stack)
-3. [Architecture](#architecture)
-4. [Phase 1: Backend Setup](#phase-1-backend-setup)
-5. [Phase 2: Backend Implementation](#phase-2-backend-implementation)
-   - [Groq API Integration](#groq-api-integration)
-   - [In-Memory Caching Strategy](#in-memory-caching-strategy)
-   - [Streaming Implementation](#streaming-implementation)
-   - [Error Handling & Resilience](#error-handling--resilience)
-6. [Phase 3: Frontend — Extension Development](#phase-3-frontend--extension-development)
-7. [Phase 4: Frontend — Wire to Backend](#phase-4-frontend--wire-to-backend)
-8. [Phase 5: Testing & Deployment](#phase-5-testing--deployment)
-9. [API Reference](#api-reference)
-10. [Troubleshooting](#troubleshooting)
+3. [Architecture Diagram](#architecture-diagram)
+4. [Current Implementation Status](#current-implementation-status)
+5. [Backend Implementation](#backend-implementation)
+6. [Frontend Implementation](#frontend-implementation)
+7. [Message Passing Flow](#message-passing-flow)
+8. [Content Extraction Strategy](#content-extraction-strategy)
+9. [Streaming & Caching](#streaming--caching)
+10. [Frontend UI & UX](#frontend-ui--ux)
+11. [Running the Extension](#running-the-extension)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Project Overview
 
-**webwhiz ai** — A Chrome extension that lets users select any text on a webpage and instantly get explanations, simplifications, summaries, or translations.
+**TeaWhiz AI** is a Chrome extension that allows users to:
+- ✅ Ask questions about any webpage
+- ✅ Get AI-powered explanations, summaries, or simplifications
+- ✅ Receive responses streamed word-by-word in real-time
+- ✅ See results in a beautiful popup UI with loading animations
+- ✅ Benefit from intelligent content extraction and response caching
 
-### Key Features
-- ✅ Selection-triggered UI (no sidebar, no login)
-- ✅ Free AI backend (Groq + Llama 3.1 8B Instant)
-- ✅ Smart in-memory caching (7-day TTL)
-- ✅ Server-side request streaming (word-by-word)
-- ✅ Automatic rate limiting with exponential backoff
-- ✅ Light/dark theme support
-- ✅ Beautiful teacup logo (#D85A3A cup, #F5A442 steam)
+### Current Capabilities
+- 🎯 **Full Page Analysis**: Automatically extracts main content from any webpage
+- 🚀 **Streaming Responses**: Word-by-word delivery via Server-Sent Events (SSE)
+- ⏱️ **Smart Loading**: 5-second "Tea is brewing..." animation before showing responses
+- 💾 **Intelligent Caching**: SHA256-based keys with 7-day TTL
+- 🤖 **Smart Model Selection**: OpenAI GPT-OSS-120B primary, fallback to ALLAM-2-7B
+- 🔄 **Graceful Degradation**: Content extraction has Readability.js + fallback mechanisms
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|-------|-----------|
-| **Frontend** | TypeScript + Vite + @crxjs/vite-plugin |
-| **Backend** | FastAPI (Python) + Groq API |
-| **AI Model** | Llama 3.1 8B Instant (free on Groq) |
-| **Caching** | In-Memory Dictionary (Python dict) |
-| **Hosting** | Render (backend) |
+| Layer | Technology | Version |
+|-------|-----------|---------|
+| **Frontend Framework** | TypeScript + Vite | Latest |
+| **Extension Plugin** | @crxjs/vite-plugin | v3 |
+| **Content Extraction** | Readability.js (Mozilla) | Latest |
+| **Build System** | Vite | v8.2.1 |
+| **Backend** | FastAPI (Python) | 0.104.1+ |
+| **AI Provider** | Groq API | Latest |
+| **AI Models** | openai/gpt-oss-120b (primary), allam-2-7b (fallback) | - |
+| **Streaming** | Server-Sent Events (SSE) | HTTP Standard |
+| **Caching** | In-Memory Python Dict | - |
+| **Deployment** | LocalHost (8000) or Cloud | - |
 
 ---
 
-## Architecture
+## Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Chrome Extension                              │
-│  ┌──────────────────┐           ┌──────────────────┐            │
-│  │  Content Script  │──────────▶│ Background Worker│            │
-│  │  (content.ts)    │  Message  │  (background.ts) │            │
-│  └──────────────────┘  Passing  └────────┬─────────┘            │
-│                                          │                       │
-│                                   HTTP POST Request              │
-└──────────────────────────────────────┬──────────────────────────┘
-                                       │
-                                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    FastAPI Backend (Render)                     │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  POST /explain                                          │   │
-│  │  ├─ 1. Check Cache (in-memory dict)                    │   │
-│  │  ├─ 2a. Cache HIT → Return instantly ⚡               │   │
-│  │  ├─ 2b. Cache MISS → Call Groq API                   │   │
-│  │  │     ├─ Exponential backoff on rate limit           │   │
-│  │  │     ├─ Async/await pattern                         │   │
-│  │  ├─ 3. Save response to cache                         │   │
-│  │  └─ 4. Return response + cached flag                  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  POST /explain-stream                                   │   │
-│  │  ├─ 1. Check Cache (in-memory dict)                    │   │
-│  │  ├─ 2a. Cache HIT → Stream cached response ⚡         │   │
-│  │  ├─ 2b. Cache MISS → Stream from Groq API            │   │
-│  │  ├─ 3. Save full response to cache                    │   │
-│  │  └─ 4. Return SSE stream with [DONE] marker           │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  GET /health                                            │   │
-│  │  └─ Check if Groq API key is configured               │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌──────────────────────────────┐                              │
-│  │  Response Cache (Dict)       │                              │
-│  │  {                           │                              │
-│  │    "hash1": {               │                              │
-│  │      "answer": "...",       │                              │
-│  │      "timestamp": "2026-..." │                              │
-│  │    },                        │                              │
-│  │    "hash2": { ... }         │                              │
-│  │  }                           │                              │
-│  │                              │                              │
-│  │  Max: 5000 entries           │                              │
-│  │  TTL: 7 days                 │                              │
-│  └──────────────────────────────┘                              │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-                                       │
-                                       ▼
-                              ┌──────────────┐
-                              │  Groq API    │
-                              │  (Free Tier) │
-                              │              │
-                              │ llama-3.1-   │
-                              │ 8b-instant   │
-                              └──────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                 Chrome Browser                              │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │           Content Script (content.ts)               │   │
+│  │  • Extracts page content with Readability.js        │   │
+│  │  • Runs at document_idle (after page fully loads)   │   │
+│  │  • Listens for GET_PAGE_CONTENT messages            │   │
+│  │  • Sends extracted content back to popup            │   │
+│  └──────────────────┬──────────────────────────────────┘   │
+│                     │                                        │
+│                     │ chrome.tabs.sendMessage()              │
+│                     │ (GET_PAGE_CONTENT)                     │
+│                     ▼                                        │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │             Popup UI (popup.ts)                     │   │
+│  │  • Main conversation interface                       │   │
+│  │  • 5-second "Tea is brewing..." animation           │   │
+│  │  • Displays user messages & AI responses             │   │
+│  │  • Accumulates streamed chunks into full response    │   │
+│  │  • Sends GET_ANSWER to background worker            │   │
+│  └──────────────────┬──────────────────────────────────┘   │
+│                     │                                        │
+│                     │ chrome.runtime.sendMessage()           │
+│                     │ (GET_ANSWER with full prompt)          │
+│                     ▼                                        │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │        Background Worker (background.ts)            │   │
+│  │  • Receives GET_ANSWER messages from popup          │   │
+│  │  • Fetches from backend /explain-stream endpoint    │   │
+│  │  • Streams response chunks back to popup            │   │
+│  │  • Handles error responses (RESPONSE_ERROR)         │   │
+│  │  • Uses chrome.runtime.sendMessage to broadcast    │   │
+│  └──────────────────┬──────────────────────────────────┘   │
+│                     │                                        │
+└─────────────────────┼────────────────────────────────────────┘
+                      │
+                      │ HTTP POST /explain-stream
+                      │ (SSE - Server-Sent Events)
+                      ▼
+        ┌──────────────────────────────┐
+        │   FastAPI Backend            │
+        │   (http://localhost:8000)    │
+        │                              │
+        │  ┌────────────────────────┐  │
+        │  │ POST /explain-stream   │  │
+        │  │                        │  │
+        │  │ 1. Receive prompt      │  │
+        │  │ 2. Check cache         │  │
+        │  │ 3a. Cache HIT?         │  │
+        │  │     ↓ Stream cached    │  │
+        │  │ 3b. Cache MISS?        │  │
+        │  │     ↓ Call Groq/OpenAI │  │
+        │  │ 4. Stream response     │  │
+        │  │ 5. Save to cache       │  │
+        │  │ 6. Send [DONE] marker  │  │
+        │  └────────────────────────┘  │
+        │                              │
+        │  ┌────────────────────────┐  │
+        │  │ Response Cache         │  │
+        │  │ • SHA256 keys          │  │
+        │  │ • 7-day TTL            │  │
+        │  │ • FIFO eviction        │  │
+        │  │ • Max 5000 entries     │  │
+        │  └────────────────────────┘  │
+        └──────────────┬───────────────┘
+                       │
+                       ▼
+            ┌──────────────────────┐
+            │   Groq/OpenAI API    │
+            │  • llama models      │
+            │  • gpt-oss models    │
+            │  • Fast inference    │
+            └──────────────────────┘
 ```
 
 ---
 
-## Phase 1: Backend Setup
+## Current Implementation Status
 
-### Step 1: Create Project Structure
+### ✅ Completed
+- [x] FastAPI backend with Groq/OpenAI API integration
+- [x] Chrome extension manifest v3 structure
+- [x] Content extraction using Readability.js
+- [x] Popup-based UI (conversation style)
+- [x] Message passing architecture (content → background → popup)
+- [x] SSE streaming from backend
+- [x] 5-second loading animation
+- [x] Response chunk accumulation
+- [x] In-memory caching with SHA256 keys and 7-day TTL
+- [x] Error handling and resilience
+- [x] Comprehensive logging at each step
+
+### 🔄 In Progress
+- [ ] Fix backend connectivity (currently localhost:8000 required)
+- [ ] Test on multiple websites
+- [ ] Optimize content extraction for different page types
+- [ ] Response quality improvements
+
+### 📝 TODO
+- [ ] Deploy backend to cloud (Render/Railway)
+- [ ] Update extension to use cloud backend URL
+- [ ] Chrome Web Store submission
+- [ ] User authentication & sync
+- [ ] Advanced settings panel
+- [ ] Dark mode refinements
+
+---
+
+## Backend Implementation
+
+### File: `backend/main.py`
+
+**Location:** `/home/kavleen/Desktop/webwhiz/backend/main.py`
+
+**Key Components:**
+
+1. **FastAPI Setup**
+   - Creates Groq API client with `GROK_API_KEY` from `.env`
+   - Primary model: `openai/gpt-oss-120b` (changed for better quality)
+   - Fallback model: `allam-2-7b`
+   - Configuration: Max 5000 cache entries, 7-day TTL
+
+2. **Caching System**
+   - **Key Generation:** SHA256 hash of `action:text` → 64-char hex string
+   - **Validation:** Checks timestamp age, auto-deletes if >7 days old
+   - **Retrieval:** Returns cached answer instantly if valid
+   - **Storage:** Saves responses with ISO timestamp
+   - **Eviction:** FIFO - removes oldest 500 entries when cache reaches 5000
+
+3. **POST /explain-stream Endpoint**
+   - Checks cache first (cache hit = instant stream)
+   - If cache miss: Calls Groq/OpenAI API
+   - Streams response word-by-word (3 words/chunk, 100ms delays)
+   - Returns SSE format: `data: chunk \n\n`
+   - Ends with: `data: [DONE]\n\n` marker
+
+4. **GET /health Endpoint**
+   - Returns status and Groq API readiness
+   - Used for backend verification
+
+#### Starting the Backend
 
 ```bash
-cd ~/Desktop/webwhiz
-
-mkdir backend
 cd backend
-
-python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-```
-
-### Step 2: Create `requirements.txt`
-
-```
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0
-python-dotenv==1.0.0
-groq>=0.15.0
-redis==5.0.1
-```
-
-### Step 3: Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### Step 4: Create `.env`
-
-```
-GROK_API_KEY=gsk_YOUR_KEY_HERE
-```
-
-Add to `.gitignore`:
-```
-.env
-venv/
-__pycache__/
-*.pyc
-.DS_Store
-```
-
----
-
-## Phase 2: Backend Implementation
-
-### Groq API Integration
-
-#### What is Groq?
-
-**Groq** is a cloud AI service that provides free access to high-performance open-source models. We're using:
-- **Model:** `llama-3.1-8b-instant`
-- **Cost:** Free (with rate limiting)
-- **Speed:** Ultra-fast inference (2-5 seconds)
-
-#### Why Groq instead of Gemini?
-
-| Feature | Groq | Gemini |
-|---------|------|--------|
-| Cost | Free | Free (API key) |
-| Speed | 🚀 Very Fast | Normal |
-| Model | Open (Llama) | Google's (Gemini) |
-| Rate Limit | Generous | Strict |
-| Setup | Easy | Easy |
-
-### In-Memory Caching Strategy
-
-The backend uses a **simple, efficient in-memory cache** built with Python dictionaries.
-
-#### How Caching Works
-
-```
-Request arrives
-  ↓
-Generate cache key (SHA256 hash of action:text)
-  ↓
-Check if key exists in response_cache dict?
-  ├─ YES: Is timestamp < 7 days old?
-  │   ├─ YES: Return cached answer ✅ (INSTANT)
-  │   └─ NO: Delete expired entry, fall through
-  └─ NO: Call Groq API (SLOW, 2-5 seconds)
-         ↓
-      Save response to cache
-         ↓
-      Return answer to user
-```
-
-#### Cache Implementation Details
-
-**1. Cache Key Generation** (lines 56-58 in main.py)
-
-```python
-def get_cache_key(text: str, action: str) -> str:
-    """Generate a SHA256 hash as the cache key"""
-    value = f"{action}:{text.strip()}"
-    return hashlib.sha256(value.encode()).hexdigest()
-```
-
-**Why hash?**
-- Fixed-length key (64 characters)
-- Handles special characters safely
-- Deterministic (same input = same key)
-- Example: `"explain:photosynthesis"` → `a3f9b8c...` (256-bit hex)
-
-**2. Cache Validation** (lines 60-65)
-
-```python
-def is_cache_valid(timestamp_iso: str, days: int = 7) -> bool:
-    """Check if cached entry is still valid (< 7 days old)"""
-    cached_time = datetime.fromisoformat(timestamp_iso)
-    return (datetime.now(timezone.utc) - cached_time) < timedelta(days=days)
-```
-
-**Why 7 days?**
-- Long enough to catch repeated requests
-- Short enough to avoid stale answers
-- Automatically expires without database
-
-**3. Retrieval Logic** (lines 67-74)
-
-```python
-def get_from_cache(text: str, action: str):
-    """Get answer from cache if valid, delete if expired"""
-    key = get_cache_key(text, action)
-    if key in response_cache:
-        entry = response_cache[key]
-        if is_cache_valid(entry["timestamp"]):  # Still valid?
-            return entry["answer"], True         # Cache hit! ✅
-        del response_cache[key]                  # Clean up expired
-    return None, False                           # Cache miss
-```
-
-**4. Storage Logic** (lines 76-87)
-
-```python
-def save_to_cache(text: str, action: str, answer: str):
-    """Save answer to cache, evict old entries if full"""
-    if len(response_cache) >= MAX_CACHE_ENTRIES:  # Max 5000
-        # Remove oldest 500 entries (10% eviction)
-        keys_to_remove = list(response_cache.keys())[:500]
-        for k in keys_to_remove:
-            response_cache.pop(k, None)
-    
-    key = get_cache_key(text, action)
-    response_cache[key] = {
-        "answer": answer,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-```
-
-**Why this eviction strategy?**
-- **Max 5000 entries:** Prevents unbounded memory growth
-- **Remove oldest 10%:** Simple FIFO (first-in-first-out)
-- **No external DB:** Everything in RAM = ultra-fast
-
-#### Cache Performance Example
-
-```bash
-# Request 1: "Explain photosynthesis" with action="explain"
-POST /explain
-{
-  "text": "photosynthesis",
-  "action": "explain"
-}
-
-Response (cache miss):
-{
-  "answer": "Photosynthesis is the process...",
-  "cached": false  # ← Not from cache
-}
-⏱️ Time: 3 seconds (Groq API call)
-
----
-
-# Request 2: Same text, same action
-POST /explain
-{
-  "text": "photosynthesis",
-  "action": "explain"
-}
-
-Response (cache hit):
-{
-  "answer": "Photosynthesis is the process...",
-  "cached": true  # ← From cache!
-}
-⏱️ Time: 0.001 seconds (instant!)
-```
-
-#### Cache Storage Format
-
-```python
-response_cache = {
-    "a3f9b8c...": {
-        "answer": "Photosynthesis is...",
-        "timestamp": "2026-08-17T10:30:00+00:00"
-    },
-    "f2d1e4c...": {
-        "answer": "Machine learning is...",
-        "timestamp": "2026-08-16T15:22:00+00:00"
-    },
-    # ... up to 5000 entries
-}
-```
-
----
-
-### Streaming Implementation
-
-The `/explain-stream` endpoint uses **Server-Sent Events (SSE)** to stream responses word-by-word to the frontend.
-
-#### What is SSE (Server-Sent Events)?
-
-A protocol that lets the server push data to the client over HTTP:
-
-```
-Client connects
-  ↓
-Server sends: "data: hello world\n\n"
-  ↓
-Client receives and renders
-  ↓
-Server sends: "data: more text\n\n"
-  ↓
-(repeat until done)
-  ↓
-Server sends: "data: [DONE]\n\n"
-  ↓
-Client closes connection
-```
-
-#### Streaming Implementation (lines 216-270)
-
-**For cached responses:**
-
-```python
-async def stream_cached():
-    words = cached_answer.split()
-    for i in range(0, len(words), 3):  # Send 3 words at a time
-        chunk = " ".join(words[i:i+3])
-        yield f"data: {chunk} \n\n"  # SSE format
-        await asyncio.sleep(0.1)     # Pause for natural feel
-    yield "data: [DONE]\n\n"         # Signal completion
-
-return StreamingResponse(stream_cached(), media_type="text/event-stream")
-```
-
-**For fresh responses from Groq:**
-
-```python
-async def stream_response():
-    # Get full response first (Groq doesn't support streaming)
-    response = await asyncio.to_thread(
-        client.chat.completions.create,
-        model=PRIMARY_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_tokens=2048
-    )
-    
-    full_response = response.choices[0].message.content
-    save_to_cache(cleaned_text, request.action, full_response)
-    
-    # Stream it word-by-word to the client
-    words = full_response.split()
-    for i in range(0, len(words), 3):
-        chunk = " ".join(words[i:i+3])
-        yield f"data: {chunk} \n\n"
-        await asyncio.sleep(0.1)
-    
-    yield "data: [DONE]\n\n"
-
-return StreamingResponse(stream_response(), media_type="text/event-stream")
-```
-
-#### Streaming Example
-
-**Request:**
-```
-POST /explain-stream
-Content-Type: application/json
-
-{
-  "text": "machine learning",
-  "action": "explain"
-}
-```
-
-**Response (Server-Sent Events):**
-```
-data: Machine learning is \n\n
-data: a subset of artificial \n\n
-data: intelligence that enables \n\n
-data: systems to learn from \n\n
-data: data without explicit \n\n
-data: programming. \n\n
-data: [DONE]\n\n
-```
-
-**Frontend receives in real-time:**
-```
-1. "Machine learning is "
-2. "a subset of artificial "
-3. "intelligence that enables "
-4. (continues...)
-```
-
----
-
-### Error Handling & Resilience
-
-#### Exponential Backoff on Rate Limits
-
-When Groq rate limits you (HTTP 429), we automatically retry with increasing delays:
-
-```python
-async def _call_groq_with_retry(model_name: str, prompt: str, max_retries: int = 2) -> str:
-    """Retry with exponential backoff: 1.5s, 2.5s"""
-    for attempt in range(max_retries + 1):
-        try:
-            response = await asyncio.to_thread(
-                client.chat.completions.create,
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=2048
-            )
-            return response.choices[0].message.content
-        except RateLimitError:
-            if attempt < max_retries:
-                delay = (2 ** attempt) + 0.5  # 1.5s, 2.5s
-                print(f"⚠️ Rate limited. Retrying in {delay}s...")
-                await asyncio.sleep(delay)
-                continue
-            raise
-```
-
-**How it works:**
-- **Attempt 1:** Fails with 429 → Wait 1.5 seconds → Retry
-- **Attempt 2:** Fails with 429 → Wait 2.5 seconds → Retry
-- **Attempt 3:** Fails with 429 → Give up, return error
-
-#### Input Validation
-
-```python
-@app.post("/explain")
-async def explain(request: ExplainRequest):
-    cleaned_text = request.text.strip()
-    
-    # Reject empty text
-    if not cleaned_text:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Text cannot be empty"
-        )
-    
-    # Validate action is supported
-    if request.action not in ACTION_PROMPTS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid action. Supported: {', '.join(ACTION_PROMPTS.keys())}"
-        )
-```
-
-#### API Response Errors
-
-```python
-# If Groq API is not configured
-raise HTTPException(
-    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-    detail="GROK_API_KEY is not configured on the server"
-)
-
-# If Groq returns empty response
-raise HTTPException(
-    status_code=status.HTTP_502_BAD_GATEWAY,
-    detail="Groq returned an empty response"
-)
-
-# If rate limit exceeded
-raise HTTPException(
-    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-    detail="Rate limit reached. Please try again later."
-)
-```
-
----
-
-## Phase 3: Frontend — Extension Development
-
-### Phase 3A: Extension Scaffold
-
-#### Step 1: Create Vite Project
-
-```bash
-cd ~/Desktop/webwhiz
-
-npm create vite@latest frontend -- --template vanilla-ts
-cd frontend
-
-npm i -D @crxjs/vite-plugin
-npm install
-```
-
-#### Step 2: Update `vite.config.ts`
-
-```typescript
-import { defineConfig } from 'vite'
-import { crx } from '@crxjs/vite-plugin'
-import manifest from './src/manifest.json'
-
-export default defineConfig({
-  plugins: [crx({ manifest })],
-  build: {
-    outDir: 'dist',
-  },
-})
-```
-
-#### Step 3: Create `src/manifest.json`
-
-```json
-{
-  "manifest_version": 3,
-  "name": "webwhiz ai",
-  "version": "0.1.0",
-  "description": "Select any text and get instant explanations, simplifications, summaries, or translations.",
-  "permissions": ["storage"],
-  "background": {
-    "service_worker": "background.ts",
-    "type": "module"
-  },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.ts"]
-    }
-  ],
-  "icons": {
-    "16": "icon.png",
-    "48": "icon.png",
-    "128": "icon.png"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": ["icon.png"],
-      "matches": ["<all_urls>"]
-    }
-  ]
-}
-```
-
-#### Step 4: Create `src/content.ts`
-
-```typescript
-// Selection detection and toolbar rendering
-
-let toolbar: ShadowRoot | null = null;
-let lastSelectedText: string = "";
-
-interface ToolbarPosition {
-  top: number;
-  left: number;
-}
-
-function getSelectionPosition(): ToolbarPosition | null {
-  const selection = window.getSelection();
-  if (!selection || selection.rangeCount === 0) return null;
-
-  const range = selection.getRangeAt(0);
-  const rect = range.getBoundingClientRect();
-
-  return {
-    top: window.scrollY + rect.bottom + 10,
-    left: window.scrollX + rect.left,
-  };
-}
-
-function renderToolbar(text: string): void {
-  if (toolbar?.host) {
-    toolbar.host.remove();
-    toolbar = null;
-  }
-
-  lastSelectedText = text;
-  const position = getSelectionPosition();
-  if (!position) return;
-
-  const container = document.createElement("div");
-  container.style.position = "fixed";
-  container.style.top = position.top + "px";
-  container.style.left = position.left + "px";
-  container.style.zIndex = "10000";
-
-  toolbar = container.attachShadow({ mode: "open" });
-
-  const style = document.createElement("style");
-  style.textContent = `
-    :host {
-      --primary: #D85A3A;
-      --steam: #F5A442;
-      --bg: #ffffff;
-      --text: #1f2937;
-      --border: #e5e7eb;
-    }
-
-    @media (prefers-color-scheme: dark) {
-      :host {
-        --bg: #1f2937;
-        --text: #f3f4f6;
-        --border: #374151;
-      }
-    }
-
-    .toolbar {
-      position: absolute;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 8px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-      display: flex;
-      gap: 8px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-
-    button {
-      background: var(--primary);
-      color: white;
-      border: none;
-      border-radius: 4px;
-      padding: 6px 12px;
-      font-size: 12px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: opacity 0.2s;
-    }
-
-    button:hover { opacity: 0.9; }
-    button:active { opacity: 0.8; }
-  `;
-  toolbar.appendChild(style);
-
-  const toolbarEl = document.createElement("div");
-  toolbarEl.className = "toolbar";
-  toolbarEl.innerHTML = `
-    <button data-action="explain">Explain</button>
-    <button data-action="simplify">Simplify</button>
-    <button data-action="summarize">Summary</button>
-    <button data-action="translate">Translate</button>
-  `;
-  toolbar.appendChild(toolbarEl);
-
-  toolbarEl.querySelectorAll("button").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      const action = (e.target as HTMLElement).getAttribute("data-action") || "explain";
-      handleAction(action);
-    });
-  });
-
-  document.body.appendChild(container);
-}
-
-function handleAction(action: string): void {
-  chrome.runtime.sendMessage(
-    { type: "GET_ANSWER", text: lastSelectedText, action },
-    (response: any) => {
-      if (response?.success) {
-        renderPopover(lastSelectedText, response.answer, action);
-        if (toolbar?.host) {
-          toolbar.host.remove();
-          toolbar = null;
-        }
-      } else {
-        renderError(response?.error || "Failed to get answer");
-      }
-    }
-  );
-}
-
-function renderPopover(text: string, answer: string, action: string): void {
-  const position = getSelectionPosition();
-  if (!position) return;
-
-  const container = document.createElement("div");
-  container.style.position = "fixed";
-  container.style.top = position.top + "px";
-  container.style.left = position.left + "px";
-  container.style.zIndex = "10000";
-
-  const popover = container.attachShadow({ mode: "open" });
-
-  const style = document.createElement("style");
-  style.textContent = `
-    :host {
-      --bg: #ffffff;
-      --text: #1f2937;
-      --border: #e5e7eb;
-      --primary: #D85A3A;
-    }
-
-    @media (prefers-color-scheme: dark) {
-      :host {
-        --bg: #1f2937;
-        --text: #f3f4f6;
-        --border: #374151;
-      }
-    }
-
-    .popover {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-      max-width: 400px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      color: var(--text);
-      line-height: 1.6;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    }
-
-    .popover h3 {
-      margin: 0 0 8px 0;
-      font-size: 14px;
-      font-weight: 600;
-      text-transform: capitalize;
-      color: var(--primary);
-    }
-
-    .popover p {
-      margin: 0;
-      font-size: 14px;
-      word-wrap: break-word;
-    }
-  `;
-  popover.appendChild(style);
-
-  const content = document.createElement("div");
-  content.className = "popover";
-  content.innerHTML = `
-    <h3>${action}</h3>
-    <p>${escapeHtml(answer)}</p>
-  `;
-  popover.appendChild(content);
-
-  document.body.appendChild(container);
-
-  setTimeout(() => {
-    try { container.remove(); } catch (e) {}
-  }, 8000);
-}
-
-function renderError(error: string): void {
-  const container = document.createElement("div");
-  container.style.position = "fixed";
-  container.style.top = "50%";
-  container.style.left = "50%";
-  container.style.transform = "translate(-50%, -50%)";
-  container.style.zIndex = "10000";
-
-  const popover = container.attachShadow({ mode: "open" });
-
-  const style = document.createElement("style");
-  style.textContent = `
-    .error {
-      background: #fee2e4;
-      border: 1px solid #fca5ac;
-      color: #c41e3a;
-      padding: 16px;
-      border-radius: 8px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      font-size: 14px;
-      max-width: 400px;
-    }
-
-    @media (prefers-color-scheme: dark) {
-      .error {
-        background: #5f2c31;
-        border: 1px solid #8b3a42;
-        color: #ff9ca3;
-      }
-    }
-  `;
-  popover.appendChild(style);
-
-  const errorEl = document.createElement("div");
-  errorEl.className = "error";
-  errorEl.textContent = "Error: " + error;
-  popover.appendChild(errorEl);
-
-  document.body.appendChild(container);
-
-  setTimeout(() => {
-    try { container.remove(); } catch (e) {}
-  }, 5000);
-}
-
-function escapeHtml(text: string): string {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-document.addEventListener("mouseup", () => {
-  const selection = window.getSelection();
-  const text = selection ? selection.toString().trim() : "";
-
-  if (text.length > 10) {
-    renderToolbar(text);
-  } else if (toolbar?.host) {
-    toolbar.host.remove();
-    toolbar = null;
-  }
-});
-
-document.addEventListener("selectionchange", () => {
-  const selection = window.getSelection();
-  const text = selection ? selection.toString().trim() : "";
-
-  if (text.length > 10) {
-    renderToolbar(text);
-  } else if (toolbar?.host) {
-    toolbar.host.remove();
-    toolbar = null;
-  }
-});
-```
-
-#### Step 5: Create `src/background.ts`
-
-```typescript
-// Background service worker - handles AI requests
-
-const BACKEND_URL = "http://localhost:8000/explain";  // Change when deploying
-const BACKEND_STREAM_URL = "http://localhost:8000/explain-stream";
-
-interface MessageRequest {
-  type: string;
-  text: string;
-  action: string;
-}
-
-interface AIResponse {
-  success: boolean;
-  answer?: string;
-  error?: string;
-}
-
-async function getAnswer(text: string, action: string): Promise<string> {
-  // Always use backend for now (can add Nano support later)
-  return await callBackend(text, action);
-}
-
-async function callBackend(text: string, action: string): Promise<string> {
-  try {
-    const response = await fetch(BACKEND_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text,
-        action,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Backend error: ${response.status}`);
-    }
-
-    const data: any = await response.json();
-
-    if (data.answer) {
-      return data.answer;
-    } else {
-      throw new Error(data.error || "Backend returned an error");
-    }
-  } catch (error) {
-    throw new Error(`Backend failed: ${(error as Error).message}`);
-  }
-}
-
-function buildPrompt(text: string, action: string): string {
-  const prompts: Record<string, string> = {
-    explain: `Explain this clearly in 2-3 sentences: "${text}"`,
-    simplify: `Simplify this into basic language anyone can understand: "${text}"`,
-    summarize: `Summarize this in one sentence: "${text}"`,
-    translate: `Translate this to Hindi: "${text}"`,
-  };
-
-  return prompts[action] || prompts.explain;
-}
-
-chrome.runtime.onMessage.addListener(
-  (request: MessageRequest, sender: any, sendResponse: (response: AIResponse) => void) => {
-    if (request.type === "GET_ANSWER") {
-      getAnswer(request.text, request.action)
-        .then((answer) => {
-          sendResponse({ success: true, answer });
-        })
-        .catch((error) => {
-          sendResponse({ success: false, error: (error as Error).message });
-        });
-
-      return true; // Keep channel open for async response
-    }
-  }
-);
-```
-
-#### Step 6: Build and Load
-
-```bash
-npm run build
-
-# Load in Chrome:
-# 1. chrome://extensions
-# 2. Developer mode ON (top right)
-# 3. Load unpacked → select dist/
-```
-
-**Test:** Select text on any webpage. Toolbar should appear.
-
-✅ **Milestone: Extension UI works**
-
----
-
-## Phase 4: Frontend — Wire to Backend
-
-### Step 1: Start Backend Locally
-
-```bash
-cd ~/Desktop/webwhiz/backend
 source venv/bin/activate
-python main.py
+python -m uvicorn main:app --reload --port 8000
 ```
 
-You should see:
-```
-✅ TeaWhiz AI - Groq API configured (Model: llama-3.1-8b-instant)
-INFO: Uvicorn running on http://0.0.0.0:8000
-```
-
-### Step 2: Test Backend with curl
-
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Test /explain endpoint
-curl -X POST http://localhost:8000/explain \
-  -H "Content-Type: application/json" \
-  -d '{"text":"machine learning","action":"explain"}'
-
-# Test /explain-stream endpoint
-curl -X POST http://localhost:8000/explain-stream \
-  -H "Content-Type: application/json" \
-  -d '{"text":"machine learning","action":"explain"}'
-```
-
-### Step 3: Test Extension
-
-1. Open any website (e.g., Wikipedia)
-2. Select text (> 10 characters)
-3. Click "Explain" button
-4. Response should appear in popover
-5. Check DevTools → Application → Logs for debug messages
-
-### Step 4: Verify Caching
-
-Make two identical requests:
-
-```bash
-curl -X POST http://localhost:8000/explain \
-  -H "Content-Type: application/json" \
-  -d '{"text":"photosynthesis","action":"explain"}'
-```
-
-First response: `"cached": false` (slow, 2-5 seconds)
-Second response: `"cached": true` (instant)
-
-✅ **Milestone: Extension ↔ Backend wired**
+Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 
 ---
 
-## Phase 5: Testing & Deployment
+## Frontend Implementation
 
-### Local Testing Checklist
+### File: `frontend/src/manifest.json`
 
-- [ ] Extension loads unpacked without errors
-- [ ] Selection detection works (>10 chars)
-- [ ] Toolbar appears next to selection
-- [ ] All 4 buttons work (Explain, Simplify, Summary, Translate)
-- [ ] Backend returns answers correctly
-- [ ] Cache hits return instantly (check `"cached": true`)
-- [ ] Dark mode colors render correctly
-- [ ] Works on 3+ different websites
+**Location:** `/home/kavleen/Desktop/webwhiz/frontend/src/manifest.json`
 
-### Deployment to Render
+**Key Settings:**
+- Manifest v3 (latest Chrome extension format)
+- **Background worker:** Handles all backend communication
+- **Content scripts:** Inject Readability.js on all pages
+- **`run_at: "document_idle"`** ⚠️ CRITICAL: Waits for DOM to fully load before extraction (prevents Readability.js crashes)
+- **Action popup:** Shows main UI when extension icon clicked
+- **Icons:** TeaWhiz logo at multiple sizes
 
-#### Step 1: Push to GitHub
+### File: `frontend/src/content.ts`
+
+**Location:** `/home/kavleen/Desktop/webwhiz/frontend/src/content.ts`
+
+**Purpose:** Extract main webpage content using Readability.js with fallback mechanism
+
+**Key Functions:**
+- **`extractWithReadability()`:** Use Mozilla's Readability library to parse article/main content
+  - ⚠️ Uses REAL document (not clone) - Readability needs real DOM access
+  - Removes ads, navigation, noise automatically
+  - Returns clean textContent if extraction succeeds
+
+- **`extractFallback()`:** Selector-based extraction if Readability fails
+  - Tries: `<article>`, `<main>`, `.main-content`, `.article-content`, etc.
+  - Falls back to `document.body.innerText` as last resort
+
+- **`getPageContent()`:** Orchestrates extraction pipeline
+  - Tries Readability first
+  - If returns <100 chars, uses fallback
+  - Limits output to MAX_CONTENT_LENGTH (8000 chars)
+  - Includes page title in response
+
+- **Message Listener:** Responds to `GET_PAGE_CONTENT` messages from popup
+  - Synchronous response (no async/await issues)
+  - Includes error handling
+
+### File: `frontend/src/background.ts`
+
+**Location:** `/home/kavleen/Desktop/webwhiz/frontend/src/background.ts`
+
+**Purpose:** Message handler between popup and backend API
+
+**Key Functions:**
+- **`streamAnswer(text)`:** Main handler for AI requests
+  - Fetches from `http://localhost:8000/explain-stream`
+  - Reads SSE stream (Server-Sent Events)
+  - Parses `data: chunk \n\n` format
+  - Broadcasts chunks back to popup
+
+- **`broadcastResponse(message)`:** Send response to all runtime listeners
+  - Uses `chrome.runtime.sendMessage()` (not tabs)
+  - Catches errors silently (listener may be gone)
+  - Messages: RESPONSE_CHUNK, RESPONSE_DONE, RESPONSE_ERROR
+
+- **Message Listener:** Catches `GET_ANSWER` from popup
+  - Extracts text from message
+  - Calls `streamAnswer()`
+  - Returns `true` to keep channel open for async response
+
+### File: `frontend/src/popup.ts`
+
+**Location:** `/home/kavleen/Desktop/webwhiz/frontend/src/popup.ts`
+
+**Purpose:** Main UI - conversation interface with loading animation
+
+**Key Functions:**
+- **`loadPageContent()`:** When popup opens, request page content from content script
+  - Uses `chrome.tabs.sendMessage()` with GET_PAGE_CONTENT
+  - Stores result in `pageContent` variable
+
+- **`submit()`:** User submits a question
+  - Combines: `pageContent + "\n\n---\n\n" + userQuestion`
+  - Sends to background worker: GET_ANSWER message
+  - Shows user message immediately
+  - Starts 5-second loading animation
+
+- **`showLoading()`:** Display teacup animation during 5-second wait
+  - Creates loading message with icon
+  - Cycles through: "boiling" → "brewing" → "teaying" → "sipping" → "vibing"
+  - Updates every 600ms
+
+- **`stopLoading()`:** Remove loading animation
+  - Called once when first chunk arrives
+  - Stops animation interval
+
+- **Response Handler:** Listen for chunks from background
+  - RESPONSE_CHUNK: Append to response element
+  - Only delay FIRST chunk by remaining 5 seconds
+  - Display subsequent chunks immediately
+  - RESPONSE_DONE: Stop button, re-enable submit
+  - RESPONSE_ERROR: Show error message
+
+---
+
+## Message Passing Flow
+
+### Step-by-Step Message Flow
+
+1. **Popup Opens** → `loadPageContent()` calls `chrome.tabs.sendMessage(GET_PAGE_CONTENT)`
+2. **Content Script** → Receives message, extracts content via Readability, sends back
+3. **Popup Receives** → Stores `pageContent` variable for later use
+4. **User Submits** → Builds `fullPrompt = pageContent + userQuestion`, sends `GET_ANSWER` to background
+5. **Background** → Receives GET_ANSWER, calls `streamAnswer(text)`, fetches from `/explain-stream`
+6. **Backend** → Checks cache, calls Groq/OpenAI if needed, streams SSE chunks
+7. **Background Parses** → Reads SSE stream, extracts chunks, broadcasts via `chrome.runtime.sendMessage()`
+8. **Popup Accumulates** → Catches RESPONSE_CHUNK messages, waits 5 seconds, then appends chunks
+9. **Complete** → Receives RESPONSE_DONE, removes loading animation, shows full response
+
+---
+
+## Content Extraction Strategy
+
+### Why Readability.js?
+
+Modern webpages have tons of noise:
+- Navigation menus
+- Sidebars
+- Ads
+- Footer links
+- Tracking scripts
+
+**Readability.js** is Mozilla's library that:
+- ✅ Removes boilerplate HTML
+- ✅ Extracts main article/content
+- ✅ Returns clean text only
+- ✅ Handles complex page structures
+
+### Extraction Pipeline
+
+1. **Wait for page load** (`document_idle`) → Ensures all content is rendered
+2. **Try Readability** → `new Readability(document).parse()` → Returns article text
+3. **Fallback if needed** → If <100 chars, try selector-based extraction
+   - Looks for: `<article>`, `<main>`, `.main-content`, `.article-content`, etc.
+4. **Last resort** → If all else fails, use `document.body.innerText`
+5. **Clean text** → Remove extra spaces, preserve paragraph breaks
+6. **Limit length** → Trim to MAX_CONTENT_LENGTH (8000 chars)
+7. **Return** → Formatted as `"Page Title: ...\n\nContent: ..."`
+
+**Example:** Messy HTML with ads/nav → Gets cleaned to just article text
+
+---
+
+## Streaming & Caching
+
+### SSE (Server-Sent Events) Format
+
+Backend streams responses in SSE format:
+- Each chunk: `data: words here \n\n`
+- Final marker: `data: [DONE]\n\n`
+- Frontend parses by splitting on `\n\n`, extracting `data: ` prefix
+
+### Caching Performance
+
+| Scenario | Process | Time |
+|----------|---------|------|
+| **Cache Hit** | SHA256 hash → lookup → instant ⚡ | ~1ms |
+| **Cache Miss** | Hash → miss → API call → stream → save → send | 2-5 sec |
+
+### Cache Storage Format
+
+Dictionary with SHA256 keys:
+- Key: `hashlib.sha256(f"{action}:{text}")` → 64-char hex
+- Value: `{ "answer": "...", "timestamp": "ISO string" }`
+- Max 5000 entries, FIFO eviction, 7-day TTL
+
+---
+
+## Frontend UI & UX
+
+### Popup Layout
+
+```
+┌─────────────────────────────┐
+│  TeaWhiz AI                 │
+│  Ask about any webpage      │
+├─────────────────────────────┤
+│                             │
+│  User: "What is this page?" │
+│                             │
+│  🫖 Tea is brewing...       │ ← 5-second loading
+│                             │
+│     (after 5 seconds)       │
+│                             │
+│  AI: "This page is about..."│
+│                             │
+├─────────────────────────────┤
+│  [Ask...                  ✕] │
+│                           ⬆ │
+└─────────────────────────────┘
+```
+
+### Styling
+
+**Colors:**
+- Primary: `#D85A3A` (orange/brown - teacup)
+- Accent: `#F5A442` (orange/gold - steam)
+- Dark mode supported via CSS variables
+
+**Animations:**
+- Loading teacup: `floatTeacup 2s ease-in-out infinite`
+- Message appearance: `slideIn 0.3s ease`
+- Button hover: `scale(1.1)`
+
+**Responsive:**
+- Width: 500px fixed
+- Height: 600px fixed (scrollable)
+- Fonts: System fonts (-apple-system, Segoe UI, Roboto)
+
+---
+
+## Running the Extension
+
+### Quick Start
 
 ```bash
-cd ~/Desktop/webwhiz/backend
-git init
-git add .
-git commit -m "Initial backend with Groq"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/webwhiz-backend.git
-git push -u origin main
-```
+# 1. Start backend
+cd /home/kavleen/Desktop/webwhiz/backend
+source venv/bin/activate
+python -m uvicorn main:app --reload --port 8000
 
-#### Step 2: Deploy on Render
-
-1. Go to [render.com](https://render.com)
-2. Click "New +" → "Web Service"
-3. Select your GitHub repo
-4. Configure:
-   - **Name:** `webwhiz-backend`
-   - **Environment:** `Python 3`
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port 10000`
-5. Add Environment Variables:
-   - `GROK_API_KEY` = your Groq API key
-6. Click "Create Web Service"
-
-You'll get a URL like:
-```
-https://webwhiz-backend.onrender.com
-```
-
-#### Step 3: Test Deployed Backend
-
-```bash
-curl https://webwhiz-backend.onrender.com/health
-
-curl -X POST https://webwhiz-backend.onrender.com/explain \
-  -H "Content-Type: application/json" \
-  -d '{"text":"test","action":"explain"}'
-```
-
-#### Step 4: Update Extension to Use Deployed Backend
-
-Edit `frontend/src/background.ts`:
-
-```typescript
-const BACKEND_URL = "https://webwhiz-backend.onrender.com/explain";
-const BACKEND_STREAM_URL = "https://webwhiz-backend.onrender.com/explain-stream";
-```
-
-Rebuild extension:
-```bash
-cd ~/Desktop/webwhiz/frontend
+# 2. In another terminal, build frontend
+cd /home/kavleen/Desktop/webwhiz/frontend
 npm run build
+
+# 3. Load in Chrome
+# - Go to chrome://extensions
+# - Toggle "Developer mode" (top right)
+# - Click "Load unpacked"
+# - Select frontend/dist/
+
+# 4. Test
+# - Go to any website
+# - Click TeaWhiz AI extension icon
+# - Type a question
+# - Wait 5 seconds for "Tea is brewing..."
+# - Read the response!
 ```
 
-Reload extension in Chrome.
+### Verification Checklist
 
----
-
-## API Reference
-
-### POST /explain
-
-**Standard (non-streaming) endpoint**
-
-**Request:**
-```json
-{
-  "text": "machine learning",
-  "action": "explain"
-}
-```
-
-**Response:**
-```json
-{
-  "answer": "Machine learning is a subset of artificial intelligence...",
-  "cached": false
-}
-```
-
-**Actions:**
-- `explain` — Clear explanation (2-3 sentences)
-- `simplify` — Simplified language for general audience
-- `summarize` — One-sentence summary
-- `translate` — Hindi translation
-
-**Response Headers:**
-```
-Content-Type: application/json
-```
-
----
-
-### POST /explain-stream
-
-**Streaming (Server-Sent Events) endpoint**
-
-**Request:**
-```json
-{
-  "text": "machine learning",
-  "action": "explain"
-}
-```
-
-**Response Stream:**
-```
-data: Machine learning is \n\n
-data: a subset of artificial \n\n
-data: intelligence that enables \n\n
-...
-data: [DONE]\n\n
-```
-
-**Response Headers:**
-```
-Content-Type: text/event-stream
-Cache-Control: no-cache
-Connection: keep-alive
-```
-
-**Frontend Implementation:**
-```javascript
-const eventSource = new EventSource('/explain-stream');
-
-eventSource.onmessage = (event) => {
-  if (event.data === '[DONE]') {
-    eventSource.close();
-  } else {
-    console.log('Received chunk:', event.data);
-  }
-};
-```
-
----
-
-### GET /health
-
-**Health check endpoint**
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "service": "TeaWhiz AI API (Groq)",
-  "groq_ready": true
-}
-```
+- [ ] Backend running on http://localhost:8000
+- [ ] `/health` endpoint responds
+- [ ] Frontend builds without errors
+- [ ] Extension loads in chrome://extensions
+- [ ] Extension icon visible
+- [ ] Click extension icon → popup opens
+- [ ] Ask a question about current page
+- [ ] 5-second loading animation appears
+- [ ] Response streams in word-by-word
+- [ ] Multiple questions work
+- [ ] Cache works (2nd identical question is instant)
 
 ---
 
 ## Troubleshooting
 
-### Backend Won't Start
+### Backend Issues
 
-**Error:** `TypeError: Client.__init__() got an unexpected keyword argument 'proxies'`
+**Error: `TypeError: Failed to fetch`**
+- ❌ Backend not running
+- ✅ Start backend: `python -m uvicorn main:app --reload`
 
-**Solution:** Upgrade groq to latest version
-```bash
-pip install --upgrade groq
+**Error: `net::ERR_CONNECT_FAILED`**
+- ❌ Backend not accessible on localhost:8000
+- ✅ Check firewall, port number, backend process
+
+**Error: `GROK_API_KEY not configured`**
+- ❌ `.env` file missing or empty
+- ✅ Add to `backend/.env`: `GROK_API_KEY=gsk_YOUR_KEY`
+
+### Frontend Issues
+
+**Extension won't load**
+- ❌ `npm run build` failed
+- ✅ Check for TypeScript errors, rebuild
+
+**Popup won't open**
+- ❌ Extension disabled or corrupted
+- ✅ Try reloading extension in chrome://extensions
+
+**No page content extracted**
+- ❌ Content script not running
+- ✅ Check DevTools Console → look for `[TeaWhiz] Content script loaded`
+- ✅ Verify `run_at: "document_idle"` in manifest
+
+**Response not appearing**
+- ❌ Backend connection failed (see Network tab)
+- ❌ Response chunks not being parsed
+- ✅ Check DevTools Console for streaming logs
+- ✅ Open Network tab → /explain-stream request → Response tab
+
+**Response disappears after appearing**
+- ❌ Old issue (fixed): Response elements being removed
+- ✅ Current implementation should work - check console for errors
+
+### Debugging Tips
+
+**1. Check Console Logs**
+```
+DevTools → Console tab
+Look for: [TeaWhiz] prefixed logs
+```
+
+**2. Check Network Tab**
+```
+DevTools → Network tab
+Filter: /explain-stream
+Check Status (should be 200)
+Check Response (should show SSE chunks)
+```
+
+**3. Inspect Elements**
+```
+DevTools → Elements tab
+Find: #responseContent element
+Should have textContent accumulating chunks
+```
+
+**4. Backend Logs**
+```
+Terminal running backend
+Should show streaming logs
 ```
 
 ---
 
-### Extension Doesn't Detect Selection
+## Summary
 
-- Selection must be **> 10 characters**
-- Check DevTools console for JavaScript errors
-- Reload page and extension
-- Verify `content.ts` is injected (DevTools → Sources)
+### What We Built
 
----
+✅ **Chrome Extension** with popup UI that:
+- Extracts webpage content intelligently
+- Sends questions to backend
+- Displays streaming responses
+- Shows loading animation
+- Supports multiple questions
 
-### Toolbar Not Appearing
+✅ **FastAPI Backend** that:
+- Integrates with Groq/OpenAI APIs
+- Caches responses (7-day TTL)
+- Streams responses via SSE
+- Handles errors gracefully
+- Validates inputs
 
-- Check Shadow DOM in DevTools → Elements
-- Verify CSS `z-index: 10000`
-- Check console for JavaScript errors
-- Reload extension
+✅ **Message Architecture** that:
+- Connects content script → background → popup
+- Handles async/await patterns properly
+- Prevents race conditions
+- Logs everything for debugging
 
----
-
-### Backend Returns 500 Error
-
-- Check `.env` file has `GROK_API_KEY` set
-- Verify API key is valid (get from [console.groq.com](https://console.groq.com))
-- Check backend logs: `tail -f logs.txt`
-
----
-
-### Cache Not Working
-
-Check if entry is in cache:
-```python
-print(response_cache)  # Should show entries
-```
-
-Verify timestamp is valid:
-```python
-from datetime import datetime, timezone, timedelta
-ts = "2026-08-17T10:30:00+00:00"
-is_valid = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)) < timedelta(days=7)
-print(is_valid)  # Should be True
-```
-
----
-
-### Streaming Not Working
-
-1. Test endpoint with curl:
-```bash
-curl -N -X POST http://localhost:8000/explain-stream \
-  -H "Content-Type: application/json" \
-  -d '{"text":"test","action":"explain"}'
-```
-
-You should see chunks ending with `[DONE]`
-
-2. Check if frontend is using correct URL
-3. Verify `Content-Type: text/event-stream` header
-
----
-
-## Commands Reference
-
-```bash
-# Backend Setup
-cd ~/Desktop/webwhiz/backend
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Backend Run
-python main.py
-# OR with hot reload:
-uvicorn main:app --reload
-
-# Backend Test
-curl http://localhost:8000/health
-curl -X POST http://localhost:8000/explain \
-  -H "Content-Type: application/json" \
-  -d '{"text":"test","action":"explain"}'
-
-# Frontend Setup
-cd ~/Desktop/webwhiz/frontend
-npm install
-
-# Frontend Build
-npm run build
-
-# Frontend Dev
-npm run dev
-
-# Git
-git add .
-git commit -m "message"
-git push origin main
-```
-
----
-
-## Directory Structure
+### Files Structure
 
 ```
 webwhiz/
-├── CODE.md                    ← You are here
-│
+├── CODE.md (← You are here)
 ├── backend/
-│   ├── main.py               ← All FastAPI code
+│   ├── main.py (FastAPI backend)
 │   ├── requirements.txt
-│   ├── .env                  ← Never commit (GROK_API_KEY)
-│   ├── .gitignore
+│   ├── .env (API keys)
 │   └── venv/
-│
-└── frontend/
-    ├── src/
-    │   ├── manifest.json
-    │   ├── content.ts
-    │   └── background.ts
-    ├── public/
-    │   └── icon.png
-    ├── vite.config.ts
-    ├── tsconfig.json
-    ├── package.json
-    └── dist/                 ← Load unpacked from here
+├── frontend/
+│   ├── src/
+│   │   ├── manifest.json (Extension config)
+│   │   ├── content.ts (Content extraction)
+│   │   ├── background.ts (Message handler)
+│   │   ├── popup.ts (UI & streaming)
+│   │   └── popup.html (UI structure)
+│   ├── public/
+│   │   └── icon.png (TeaWhiz logo)
+│   ├── vite.config.ts (Build config)
+│   └── dist/ (← Load unpacked from here)
 ```
+
+### Next Steps
+
+1. ✅ Verify backend is running
+2. ✅ Build frontend: `npm run build`
+3. ✅ Load extension: chrome://extensions → Load unpacked
+4. ✅ Test on real websites
+5. ⏳ Deploy backend to cloud (Render/Railway)
+6. ⏳ Submit to Chrome Web Store
 
 ---
 
-## Environment Variables
-
-**In `backend/.env` (never commit):**
-```
-GROK_API_KEY=gsk_YOUR_KEY_HERE
-```
-
-**To get Groq API key:**
-1. Go to [console.groq.com](https://console.groq.com)
-2. Sign up (free)
-3. Create API key
-4. Copy to `.env`
-
----
-
-## Next Steps
-
-1. **Verify Backend Works:**
-   ```bash
-   cd backend
-   source venv/bin/activate
-   python main.py
-   ```
-
-2. **Test with curl:**
-   ```bash
-   curl -X POST http://localhost:8000/explain \
-     -H "Content-Type: application/json" \
-     -d '{"text":"AI","action":"explain"}'
-   ```
-
-3. **Build Extension:**
-   ```bash
-   cd frontend
-   npm run build
-   ```
-
-4. **Load in Chrome:**
-   - `chrome://extensions`
-   - Developer mode ON
-   - Load unpacked → `frontend/dist/`
-
-5. **Test on any website** by selecting text
-
-Ready? Start with:
-```bash
-cd backend
-python main.py
-```
-
-Let's build! 🚀
+**Last Updated:** August 27, 2026  
+**Status:** Core functionality working, ready for cloud deployment  
+**Next:** Deploy backend + cloud URLs
