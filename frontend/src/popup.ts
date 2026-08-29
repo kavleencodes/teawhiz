@@ -45,16 +45,68 @@ async function loadPageContent() {
 
 loadPageContent();
 
-// Markdown rendering function
+// Markdown rendering function with fallback
 function renderMarkdown(text: string): string {
   try {
-    // Use marked library to convert markdown to HTML
-    return (marked as any).parse(text);
+    // Check if marked is available
+    if (typeof marked !== 'undefined' && marked.parse) {
+      const html = (marked as any).parse(text);
+      console.log("[TeaWhiz] Markdown rendered with marked library");
+      return html;
+    } else {
+      console.log("[TeaWhiz] Marked not available, using basic markdown fallback");
+      return basicMarkdownToHTML(text);
+    }
   } catch (error) {
     console.error("[TeaWhiz] Markdown rendering error:", error);
-    // Fallback to plain text if markdown fails
-    return `<p>${text.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>`;
+    return basicMarkdownToHTML(text);
   }
+}
+
+// Basic markdown to HTML converter (fallback when marked library isn't available)
+function basicMarkdownToHTML(text: string): string {
+  let html = text
+    // Escape HTML
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  // Headers
+  html = html.replace(/^### (.*?)$/gm, "<h3>$1</h3>");
+  html = html.replace(/^## (.*?)$/gm, "<h2>$1</h2>");
+  html = html.replace(/^# (.*?)$/gm, "<h1>$1</h1>");
+
+  // Bold
+  html = html.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/__(.+?)__/g, "<strong>$1</strong>");
+
+  // Italic
+  html = html.replace(/\*(.*?)\*/g, "<em>$1</em>");
+  html = html.replace(/_(.*?)_/g, "<em>$1</em>");
+
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  // Lists
+  html = html.replace(/^\* (.*?)$/gm, "<li>$1</li>");
+  html = html.replace(/^- (.*?)$/gm, "<li>$1</li>");
+  html = html.replace(/(<li>.*<\/li>)/s, "<ul>$1</ul>");
+
+  // Line breaks to paragraphs
+  const paragraphs = html.split("\n\n");
+  html = paragraphs
+    .map((p) => {
+      if (!p.match(/^<(h[1-6]|ul|ol|li|pre|blockquote)/)) {
+        return `<p>${p}</p>`;
+      }
+      return p;
+    })
+    .join("\n");
+
+  // Fix nested ul/ol
+  html = html.replace(/<\/ul>\n<ul>/g, "\n").replace(/<\/ol>\n<ol>/g, "\n");
+
+  return html;
 }
 
 // Load saved prompt
