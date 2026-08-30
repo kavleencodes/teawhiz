@@ -16,8 +16,9 @@
 8. [Content Extraction Strategy](#content-extraction-strategy)
 9. [Streaming & Caching](#streaming--caching)
 10. [Frontend UI & UX](#frontend-ui--ux)
-11. [Running the Extension](#running-the-extension)
-12. [Troubleshooting](#troubleshooting)
+11. [Case Study: Fixing the Broken FAQ Table](#case-study-fixing-the-broken-faq-table)
+12. [Running the Extension](#running-the-extension)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -38,7 +39,7 @@
 - 🤖 **Smart Model Selection**: OpenAI GPT-OSS-120B primary, fallback to ALLAM-2-7B
 - 🔄 **Graceful Degradation**: Content extraction has Readability.js + fallback mechanisms
 - 📺 **Netflix Monitoring**: Real-time dynamic content detection with MutationObserver
-- 🎨 **Beautiful Markdown**: marked.js rendering with regex fallback for gorgeous formatted responses
+- 🎨 **Beautiful Markdown**: marked (bundled via npm) rendering with regex fallback for gorgeous formatted responses, tables included
 - 📊 **Clean Tables**: Minimal table styling with subtle dividers (no ugly borders)
 
 ---
@@ -50,8 +51,8 @@
 | **Frontend Framework** | TypeScript + Vite | Latest |
 | **Extension Plugin** | @crxjs/vite-plugin | v3 |
 | **Content Extraction** | Readability.js (Mozilla) | Latest |
-| **Markdown Rendering** | marked.js (CDN) | v13.0.3 |
-| **Markdown Fallback** | Regex-based converter | Custom |
+| **Markdown Rendering** | marked (bundled via npm, not CDN) | v18.x |
+| **Markdown Fallback** | Regex-based converter (incl. GFM table support) | Custom |
 | **Dynamic Monitoring** | MutationObserver API | Browser native |
 | **Build System** | Vite | v8.2.1 |
 | **Backend** | FastAPI (Python) | 0.104.1+ |
@@ -84,7 +85,7 @@
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │             Popup UI (popup.ts)                     │   │
 │  │  • Conversation interface with message threads      │   │
-│  │  • Renders markdown with marked.js (CDN)            │   │
+│  │  • Renders markdown with marked (bundled via npm)   │   │
 │  │  • Fallback: regex-based markdown converter         │   │
 │  │  • Displays user messages & AI responses            │   │
 │  │  • Instant response display (no delay)              │   │
@@ -159,7 +160,8 @@
 - [x] SSE streaming from backend
 - [x] **Instant response display** (removed 5-second delay)
 - [x] Response chunk accumulation
-- [x] **Markdown rendering with marked.js + regex fallback**
+- [x] **Markdown rendering with marked (bundled via npm) + regex fallback (both support GFM tables)**
+- [x] **Whitespace-preserving, JSON-encoded SSE streaming** (see [Case Study](#case-study-fixing-the-broken-faq-table))
 - [x] **Netflix dynamic content monitoring with MutationObserver**
 - [x] **Clean, beautiful markdown styling**
 - [x] **Minimal table design (no borders, subtle dividers)**
@@ -172,7 +174,6 @@
 ### 🔄 In Progress
 - [ ] Test on more websites for robustness
 - [ ] Optimize Netflix extraction for edge cases
-- [ ] Verify marked.js CDN reliability across regions
 
 ### 📝 TODO
 - [ ] Deploy backend to cloud (Render/Railway)
@@ -208,8 +209,9 @@
 3. **POST /explain-stream Endpoint**
    - Checks cache first (cache hit = instant stream)
    - If cache miss: Calls Groq/OpenAI API
-   - Streams response word-by-word (3 words/chunk, 100ms delays)
-   - Returns SSE format: `data: chunk \n\n`
+   - Streams response word-by-word via `chunk_preserving_whitespace()` (~15 words/chunk, 50ms delays, real newlines kept intact)
+   - Each chunk is JSON-encoded with `to_sse_data()` (`json.dumps`) before being written to the SSE line, so markdown structure (blank lines, table rows) survives transport
+   - Returns SSE format: `data: <json-encoded chunk>\n\n`
    - Ends with: `data: [DONE]\n\n` marker
 
 4. **GET /health Endpoint**
@@ -296,7 +298,8 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 - **`streamAnswer(text)`:** Main handler for AI requests
   - Fetches from `http://localhost:8000/explain-stream`
   - Reads SSE stream (Server-Sent Events)
-  - Parses `data: chunk \n\n` format
+  - Parses `data: <json-encoded chunk>` lines, `JSON.parse()`s the payload (reverses the backend's `json.dumps`) to recover real newlines untouched
+  - Does **not** trim or re-space the chunk — whitespace at chunk boundaries is meaningful markdown structure and is forwarded as-is
   - Broadcasts chunks back to popup
 
 - **`broadcastResponse(message)`:** Send response to all runtime listeners
@@ -327,8 +330,8 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
   - Starts loading animation (teacup with rotating text)
 
 - **`renderMarkdown(text)`:** Convert markdown to beautiful HTML
-  - Primary: Uses `marked.parse()` from marked.js CDN (v13.0.3)
-  - Fallback: `basicMarkdownToHTML()` with regex patterns for headers, bold, italic, code, lists
+  - Primary: Uses `marked.parse()` from the **bundled** `marked` npm package (v18, imported directly — not loaded from a CDN; GFM/tables on by default, `gfm`/`breaks` set explicitly)
+  - Fallback (only if `marked.parse()` throws): `basicMarkdownToHTML()` with regex patterns for headers, bold, italic, code, lists, **and GFM-style pipe tables**
   - Handles both strategies seamlessly
 
 - **`showLoading()`:** Display teacup animation
@@ -362,7 +365,7 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 5. **Background** → Receives GET_ANSWER, calls `streamAnswer(text)`, fetches from `/explain-stream`
 6. **Backend** → Checks cache, calls Groq/OpenAI if needed, streams SSE chunks
 7. **Background Parses** → Reads SSE stream, extracts chunks, broadcasts via `chrome.runtime.sendMessage()`
-8. **Popup Accumulates** → Catches RESPONSE_CHUNK messages, waits 5 seconds, then appends chunks
+8. **Popup Accumulates** → Catches RESPONSE_CHUNK messages, appends each chunk to `data-raw-text` immediately, and re-renders markdown on every chunk (no artificial delay)
 9. **Complete** → Receives RESPONSE_DONE, removes loading animation, shows full response
 
 ---
@@ -371,16 +374,16 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 
 ### Two-Tier Architecture
 
-**Primary Renderer: marked.js (CDN)**
-- Loads from: `https://cdnjs.cloudflare.com/ajax/libs/marked/13.0.3/marked.min.js`
-- Full markdown spec support
+**Primary Renderer: marked (bundled via npm)**
+- Installed as a real dependency (`npm install marked`) and imported directly: `import { marked } from "marked"` in `popup.ts`
+- Bundled into the extension's JS at build time by Vite/@crxjs — **not** loaded from a CDN `<script>` tag (see [Case Study](#case-study-fixing-the-broken-faq-table) for why that mattered)
+- Full markdown spec support incl. GFM (`gfm: true`, `breaks: true` set explicitly)
 - Handles headers, bold, italic, code, lists, tables, blockquotes
-- Fast and reliable
 
 **Fallback Renderer: basicMarkdownToHTML()**
-- Activates if marked.js is unavailable
+- Only activates if `marked.parse()` throws (belt-and-suspenders, not the primary path anymore)
 - Regex-based conversion
-- Handles: `#` headers, `**bold**`, `*italic*`, `` `code` ``, `- lists`, etc.
+- Handles: `#` headers, `**bold**`, `*italic*`, `` `code` ``, `- lists`, and GFM-style pipe tables (`| a | b |` / `|---|---|` blocks → real `<table>`/`<th>`/`<td>`)
 - Escapes HTML properly
 - Ensures graceful degradation
 
@@ -708,9 +711,10 @@ Output: Clean, readable text
         │  3. Check cache:                        │
         │     ✅ HIT → Stream cached response    │
         │     ❌ MISS → Call Groq/OpenAI API    │
-        │  4. Stream response via SSE:            │
-        │     data: chunk1 \n\n                   │
-        │     data: chunk2 \n\n                   │
+        │  4. Stream response via SSE (whitespace │
+        │     preserved, JSON-encoded per chunk): │
+        │     data: "chunk1 text..."\n\n          │
+        │     data: "chunk2\\ntext..."\n\n        │
         │     data: [DONE]\n\n                    │
         │  5. Save response to cache (7-day TTL) │
         └─────────────┬───────────────────────────┘
@@ -718,11 +722,12 @@ Output: Clean, readable text
                       │ SSE Stream
                       ▼
         ┌───────────────────────────────────────┐
-        │  background.ts: parseSSE()            │
-        │  Split on \n\n                        │
-        │  Extract data: prefix from each chunk │
-        │  Broadcast via chrome.runtime.send    │
-        │  Type: "RESPONSE_CHUNK"               │
+        │  background.ts: parseSSE()             │
+        │  Split on \n                           │
+        │  Extract data: prefix, JSON.parse() it │
+        │  (reverses backend's json.dumps escape)│
+        │  Broadcast via chrome.runtime.send     │
+        │  Type: "RESPONSE_CHUNK"                │
         └─────────────┬─────────────────────────┘
                       │
                       │ chrome.runtime.onMessage
@@ -779,9 +784,9 @@ Clean, readable text content → Sent to LLM with user question → Beautiful ma
 ### SSE (Server-Sent Events) Format
 
 Backend streams responses in SSE format:
-- Each chunk: `data: words here \n\n`
+- Each chunk: `data: <json-encoded chunk>\n\n` — the chunk text is passed through Python's `json.dumps()` before being written, so any character that would otherwise break a single SSE `data:` line (newlines, but also backslashes/quotes) survives transport intact
 - Final marker: `data: [DONE]\n\n`
-- Frontend parses by splitting on `\n\n`, extracting `data: ` prefix
+- Frontend parses by splitting on `\n`, extracting the `data: ` prefix, then reversing the encoding with `JSON.parse()` — see [Case Study](#case-study-fixing-the-broken-faq-table) for why this replaced an earlier hand-rolled `\n` ↔ `\\n` escaper
 
 ### Caching Performance
 
@@ -883,6 +888,82 @@ Dictionary with SHA256 keys:
 
 ---
 
+## Case Study: Fixing the Broken FAQ Table
+
+**Symptom:** Asked the extension for a webpage's FAQs "in table format." Instead of a rendered `<table>`, the response showed the raw markdown as literal text — pipes, dashes, and all squashed onto one line, e.g.:
+
+```
+Question | Answer | |---|---------|-------|| 1 | Does BioPharmaSys sit inside
+the control loop? | No. It only reads data...
+```
+
+This took **three separate, stacked bugs** to fully fix — each one hid the next. All three were found and fixed by walking the pipeline end-to-end: LLM → backend SSE stream → background worker → popup renderer.
+
+### Bug 1 — `marked` was loaded from a CDN `<script>` tag, which Manifest V3 silently blocks
+
+`popup.html` had:
+```html
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/13.0.3/marked.min.js"></script>
+```
+Chrome's default Manifest V3 CSP disallows remotely-hosted code in extensions, so this tag never actually executed — `marked` was `undefined` at runtime. `popup.ts` detected that and silently fell back to `basicMarkdownToHTML()`, a hand-rolled regex converter that had **no table-parsing rule at all** — so a markdown table's raw `| Question | Answer |` text just passed through untouched.
+
+**Fix:**
+- `npm install marked` as a real dependency; `import { marked } from "marked"` directly in `popup.ts` so Vite/@crxjs bundles it into the extension's own JS (no remote fetch, works under MV3 policy).
+- Removed the CDN `<script>` tag from `popup.html` entirely.
+- As a safety net, also taught the regex fallback (`basicMarkdownToHTML()`) to parse GFM-style pipe tables into real `<table>`/`<th>`/`<td>` markup, in case `marked.parse()` ever throws.
+
+### Bug 2 — the backend was destroying every newline before it ever left the server
+
+Even after Bug 1 was fixed, the *exact same symptom* came back on the next test. The real root cause was upstream: `/explain-stream` chunked the LLM's response for streaming with:
+```python
+words = full_response.split()
+chunk = " ".join(words[i:i+15])
+yield f"data: {chunk} \n\n"
+```
+`text.split()` + `" ".join(...)` collapses **every** space, newline, and blank line to a single space — so by the time the text reached the browser, the table rows had no newlines left between them at all. `marked`'s table parser (correctly working after Bug 1) had nothing to parse, because the markdown structure was already gone.
+
+Interestingly, a previous session had already half-fixed this: `chunk_preserving_whitespace()` and `to_sse_data()` existed in `main.py` with a docstring correctly diagnosing the problem — but neither function was ever actually called by the live endpoints.
+
+**Fix:** wired both helpers into `stream_cached()` and `stream_response()` in `backend/main.py`, replacing the collapsing `split()`/`join()` logic.
+
+A second layer of the same bug lived in `background.ts`, which parsed each SSE line with `line.slice(6).trim()` and rebroadcast it as `chunk + " "` — `.trim()` strips exactly the newlines the backend now preserved whenever they land at a chunk boundary, then replaces them with a literal space. **Fix:** stopped trimming/re-spacing chunks in `background.ts`; whitespace is forwarded as-is.
+
+### Bug 3 (hardening) — manual `\n` escaping → JSON encoding
+
+The fix above escaped embedded newlines as literal `\n` two-character sequences (`chunk.replace("\n", "\\n")`) so a multi-line chunk could survive a single SSE `data:` line, unescaped client-side with `raw.replace(/\\n/g, "\n")`. This worked, but it's a narrower fix than it looks — it only handles newlines, and a hand-rolled escaper is easy to get subtly wrong for anything else unusual in the text (backslashes, quotes, etc.).
+
+**Final fix:** replaced the manual escaper with real JSON encoding:
+```python
+# backend/main.py
+def to_sse_data(chunk: str) -> str:
+    return json.dumps(chunk)
+```
+```ts
+// frontend/src/background.ts
+const chunk = JSON.parse(raw);  // wrapped in try/catch so a bad line logs & skips, doesn't crash the stream
+```
+The `ERROR: ...` yield path was routed through the same `to_sse_data()` helper too, so every non-`[DONE]` SSE line is valid JSON the client can parse uniformly.
+
+### Verification
+
+Rather than trust it by inspection, the whole `chunk_preserving_whitespace → to_sse_data → SSE wire format → JSON.parse → reassembly` round trip was simulated in isolation (Python generating the SSE bytes, Node parsing them back) against a sample containing a markdown table plus a backslash and a quoted string (to stress the encoding). The reassembled text came back **byte-for-byte identical** to the original.
+
+### One thing that turned out *not* to be a factor
+
+It's tempting to assume the response cache (`save_to_cache`/`get_from_cache`, SHA256-keyed, 7-day TTL) needed clearing for this fix to take effect on a repeated question. It didn't: `save_to_cache` stores the **raw LLM completion text**, before any chunking or SSE-encoding happens — cache entries were never corrupted by Bug 2 or Bug 3, only the streaming *transport* was. Re-asking a cached question re-runs it through the fixed `chunk_preserving_whitespace`/`to_sse_data` on every request regardless of cache hit/miss, so no cache-clearing was actually required. (Restarting the backend process *was* still required, since Python doesn't hot-reload edited code without `--reload` picking it up.)
+
+### Files touched
+
+| File | Change |
+|------|--------|
+| `frontend/package.json` | Added `marked` as a real dependency |
+| `frontend/src/popup.html` | Removed the CDN `<script src="...marked.min.js">` tag |
+| `frontend/src/popup.ts` | `import { marked } from "marked"`; simplified `renderMarkdown()`; added table support to `basicMarkdownToHTML()` fallback |
+| `backend/main.py` | Wired `chunk_preserving_whitespace()`/`to_sse_data()` into both stream endpoints; switched `to_sse_data()` to `json.dumps`; routed the `ERROR:` yield through it too |
+| `frontend/src/background.ts` | Stopped `.trim()`-ing / re-spacing chunks; switched from manual `\n` unescaping to `JSON.parse()` with a try/catch guard |
+
+---
+
 ## Running the Extension
 
 ### Quick Start
@@ -969,10 +1050,13 @@ npm run build
 - ✅ Open Network tab → /explain-stream request → Response tab
 
 **Markdown not rendering (showing literal `**bold**`)**
-- ❌ marked.js CDN may be blocked or unavailable
-- ✅ Check Network tab → marked.min.js should load successfully
-- ✅ Fallback regex converter will automatically activate if CDN fails
-- ✅ Look for console logs: "[TeaWhiz] Markdown rendered with marked library" or "using basic markdown fallback"
+- ❌ `marked.parse()` threw an error on this input
+- ✅ Check the console for "[TeaWhiz] Markdown rendering error" — the regex fallback (`basicMarkdownToHTML()`) activates automatically and should still render most formatting
+- Note: `marked` is bundled into the extension's JS at build time (not loaded from a CDN), so a network/CDN block is no longer a possible cause here — see [Case Study](#case-study-fixing-the-broken-faq-table)
+
+**Tables showing as literal pipe text (e.g. `| Q | A | |---|---|`) instead of a real table**
+- ❌ Most likely cause: markdown structure (real newlines between rows) got collapsed somewhere before `marked.parse()` ever saw it — check the SSE stream in the Network tab for the raw `data: ...` payloads and confirm they still contain `\n` inside the JSON-encoded chunk strings
+- ✅ See the full writeup in [Case Study: Fixing the Broken FAQ Table](#case-study-fixing-the-broken-faq-table) — this exact symptom took three stacked bugs (CDN-blocked `marked`, whitespace-collapsing SSE chunking, and a fragile manual newline escaper) to fully resolve
 
 **Tables showing with ugly borders**
 - ❌ CSS not loaded properly
@@ -1046,7 +1130,7 @@ Should show streaming logs
 - Logs everything for debugging
 
 ✅ **Beautiful UI/UX** with:
-- Markdown rendering via marked.js + regex fallback
+- Markdown rendering via marked (bundled via npm) + regex fallback
 - Theme-aware design (light/dark mode)
 - Conversation-style messaging
 - Message animations (slide-in effect)
@@ -1079,8 +1163,11 @@ webwhiz/
 
 ### Recent Updates (Latest Session)
 
+🐛 **Fixed markdown tables rendering as literal pipe text** - see [Case Study](#case-study-fixing-the-broken-faq-table) for the full three-bug investigation  
+📦 **`marked` bundled via npm instead of CDN** - required for Manifest V3 compliance, and was silently failing before  
+🔧 **SSE streaming now preserves whitespace** - `chunk_preserving_whitespace()` + JSON-encoded (`json.dumps`/`JSON.parse`) chunks replace the old whitespace-collapsing `split()`/`join()` logic  
 ✨ **Removed 5-second animation delay** - Responses display instantly  
-🎨 **Added beautiful markdown rendering** - marked.js + regex fallback  
+🎨 **Added beautiful markdown rendering** - marked (bundled) + regex fallback, both with table support  
 📺 **Netflix real-time monitoring** - MutationObserver with debouncing  
 📊 **Clean table styling** - No borders, subtle dividers  
 🎯 **Enhanced markdown CSS** - Headers, code blocks, blockquotes  
@@ -1098,7 +1185,7 @@ webwhiz/
 
 ---
 
-**Last Updated:** August 29, 2026  
+**Last Updated:** August 30, 2026  
 **Status:** Core functionality complete and tested ✅  
-**Feature Complete:** ✨ Instant responses, beautiful markdown, Netflix monitoring  
+**Feature Complete:** ✨ Instant responses, beautiful markdown (tables included), Netflix monitoring  
 **Next Phase:** Cloud deployment and Chrome Web Store submission
