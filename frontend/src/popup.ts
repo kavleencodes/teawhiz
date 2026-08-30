@@ -8,7 +8,13 @@ const promptInput = document.getElementById("prompt") as HTMLTextAreaElement;
 const submitBtn = document.getElementById("submit") as HTMLButtonElement;
 const clearBtn = document.getElementById("clearBtn") as HTMLButtonElement;
 const messagesContainer = document.getElementById("messagesContainer") as HTMLDivElement;
-const emptyState = document.getElementById("emptyState") as HTMLDivElement;
+const responseContainer = document.getElementById("responseContainer") as HTMLDivElement;
+
+// Reveal the response area (it starts hidden so only the search bar shows)
+// and let the popup expand underneath the search bar.
+function expandResponseArea() {
+  responseContainer.classList.add("active");
+}
 
 let pageContent = "";
 const loadingWords = ["boiling", "brewing", "teaying", "sipping", "vibing"];
@@ -149,7 +155,7 @@ promptInput.addEventListener("input", () => {
 clearBtn.addEventListener("click", () => {
   promptInput.value = "";
   messagesContainer.innerHTML = "";
-  emptyState.style.display = "flex";
+  responseContainer.classList.remove("active");
   chrome.storage.local.set({ savedPrompt: "" });
   promptInput.focus();
 });
@@ -185,7 +191,6 @@ function submit() {
 
   submitBtn.disabled = true;
   submitBtn.textContent = "...";
-  emptyState.style.display = "none";
 
   // Show loading animation
   showLoading();
@@ -233,10 +238,11 @@ function showMessage(text: string, type: "user" | "assistant" | "error") {
 
   messageEl.appendChild(contentEl);
   messagesContainer.appendChild(messageEl);
+  expandResponseArea();
 
   // Scroll to bottom
   setTimeout(() => {
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    responseContainer.scrollTop = responseContainer.scrollHeight;
   }, 0);
 }
 
@@ -264,6 +270,7 @@ function showLoading() {
   contentEl.appendChild(textEl);
   messageEl.appendChild(contentEl);
   messagesContainer.appendChild(messageEl);
+  expandResponseArea();
 
   loadingMessageEl = messageEl;
   currentLoadingIndex = 0;
@@ -277,7 +284,7 @@ function showLoading() {
   }, 600);
 
   // Scroll to bottom
-  messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  responseContainer.scrollTop = responseContainer.scrollHeight;
 }
 
 function stopLoading() {
@@ -308,7 +315,7 @@ chrome.runtime.onMessage.addListener((request) => {
         stopLoading();
       }
 
-      emptyState.style.display = "none";
+      expandResponseArea();
 
       // Get or create response message - use a stable ID
       let responseEl = document.getElementById("responseContent") as HTMLElement | null;
@@ -335,7 +342,7 @@ chrome.runtime.onMessage.addListener((request) => {
       responseEl.innerHTML = renderMarkdown(fullText);
       console.log("[TeaWhiz] Popup: Rendered markdown, preview:", fullText.substring(0, 50));
 
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      responseContainer.scrollTop = responseContainer.scrollHeight;
     };
 
     // Display chunks immediately (no delay)
