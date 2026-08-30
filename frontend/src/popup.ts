@@ -1,7 +1,8 @@
 // Popup script - conversation-style messaging
+import { marked } from "marked";
 
-// Declare marked global (loaded from CDN in popup.html)
-declare const marked: any;
+// GFM (tables, etc.) is on by default in marked v13+, but be explicit.
+marked.setOptions({ gfm: true, breaks: true });
 
 const promptInput = document.getElementById("prompt") as HTMLTextAreaElement;
 const submitBtn = document.getElementById("submit") as HTMLButtonElement;
@@ -45,18 +46,10 @@ async function loadPageContent() {
 
 loadPageContent();
 
-// Markdown rendering function with fallback
+// Markdown rendering function, with a hand-rolled fallback if marked throws
 function renderMarkdown(text: string): string {
   try {
-    // Check if marked is available
-    if (typeof marked !== 'undefined' && marked.parse) {
-      const html = (marked as any).parse(text);
-      console.log("[TeaWhiz] Markdown rendered with marked library");
-      return html;
-    } else {
-      console.log("[TeaWhiz] Marked not available, using basic markdown fallback");
-      return basicMarkdownToHTML(text);
-    }
+    return marked.parse(text, { async: false }) as string;
   } catch (error) {
     console.error("[TeaWhiz] Markdown rendering error:", error);
     return basicMarkdownToHTML(text);
@@ -92,11 +85,40 @@ function basicMarkdownToHTML(text: string): string {
   html = html.replace(/^- (.*?)$/gm, "<li>$1</li>");
   html = html.replace(/(<li>.*<\/li>)/s, "<ul>$1</ul>");
 
+  // GFM-style pipe tables, e.g.:
+  //   | Question | Answer |
+  //   |---|---|
+  //   | Does X? | No. |
+  const tableBlock =
+    /^\|(.+)\|[ \t]*\n\|[ \t\-:|]+\|[ \t]*\n((?:\|.*\|[ \t]*\n?)+)/gm;
+  const splitRow = (row: string) =>
+    row
+      .trim()
+      .replace(/^\||\|$/g, "")
+      .split("|")
+      .map((cell) => cell.trim());
+  html = html.replace(tableBlock, (_match, headerRow: string, bodyRows: string) => {
+    const headerCells = splitRow(headerRow)
+      .map((cell) => `<th>${cell}</th>`)
+      .join("");
+    const bodyHtml = bodyRows
+      .trim()
+      .split("\n")
+      .map((row) => {
+        const cells = splitRow(row)
+          .map((cell) => `<td>${cell}</td>`)
+          .join("");
+        return `<tr>${cells}</tr>`;
+      })
+      .join("");
+    return `<table><thead><tr>${headerCells}</tr></thead><tbody>${bodyHtml}</tbody></table>\n`;
+  });
+
   // Line breaks to paragraphs
   const paragraphs = html.split("\n\n");
   html = paragraphs
     .map((p) => {
-      if (!p.match(/^<(h[1-6]|ul|ol|li|pre|blockquote)/)) {
+      if (!p.match(/^<(h[1-6]|ul|ol|li|pre|blockquote|table)/)) {
         return `<p>${p}</p>`;
       }
       return p;

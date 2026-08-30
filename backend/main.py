@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import hashlib
 import asyncio
 from datetime import datetime, timezone, timedelta
@@ -98,6 +100,44 @@ ACTION_PROMPTS = {
     "summarize": "Provide a 2-3 sentence summary of the main points from this webpage content:\n\n{text}",
     "translate": "Translate the following text to Hindi. Return only the Hindi translation without explanation:\n\n{text}",
 }
+
+
+def chunk_preserving_whitespace(text: str, words_per_chunk: int = 15):
+    """Split text into ~words_per_chunk-word pieces without discarding whitespace.
+
+    `text.split()` + `" ".join(...)` (the old approach) collapses every space,
+    newline, and blank line to a single space, which destroys markdown
+    structure (paragraph breaks, table rows) before it ever reaches the
+    client. This keeps every original whitespace character exactly where it
+    was, so the streamed-and-reassembled text is byte-for-byte the same as
+    `text`.
+    """
+    tokens = re.split(r"(\s+)", text)
+    buffer = []
+    word_count = 0
+    for token in tokens:
+        if token == "":
+            continue
+        buffer.append(token)
+        if not token.isspace():
+            word_count += 1
+            if word_count >= words_per_chunk:
+                yield "".join(buffer)
+                buffer = []
+                word_count = 0
+    if buffer:
+        yield "".join(buffer)
+
+
+def to_sse_data(chunk: str) -> str:
+    """JSON-encode the chunk so it survives a single SSE `data:` line intact.
+
+    A raw chunk can contain newlines (breaks the `data:` line framing) as
+    well as backslashes, quotes, or other characters a hand-rolled escaper
+    would mangle (e.g. code blocks, Windows paths). `json.dumps` handles all
+    of that correctly and the client reverses it with a plain `JSON.parse`.
+    """
+    return json.dumps(chunk)
 
 async def _call_groq_with_retry(model_name: str, prompt: str, max_retries: int = 2) -> str:
     """Invokes Groq API with exponential backoff on rate limit errors."""
@@ -222,10 +262,8 @@ async def explain_stream(request: ExplainRequest):
     if from_cache:
         # Stream cached response in word chunks (like Claude)
         async def stream_cached():
-            words = cached_answer.split()
-            for i in range(0, len(words), 15):  # 15 words at a time for better sentence alignment
-                chunk = " ".join(words[i:i+15])
-                yield f"data: {chunk} \n\n"
+            for chunk in chunk_preserving_whitespace(cached_answer, 15):
+                yield f"data: {to_sse_data(chunk)}\n\n"
                 await asyncio.sleep(0.05)  # Shorter pause for smooth flow
             yield "data: [DONE]\n\n"
         return StreamingResponse(stream_cached(), media_type="text/event-stream")
@@ -249,17 +287,15 @@ async def explain_stream(request: ExplainRequest):
             save_to_cache(cleaned_text, request.action, full_response)
 
             # Stream it in word chunks (like Claude)
-            words = full_response.split()
-            for i in range(0, len(words), 15):  # 15 words at a time for better sentence alignment
-                chunk = " ".join(words[i:i+15])
-                yield f"data: {chunk} \n\n"
+            for chunk in chunk_preserving_whitespace(full_response, 15):
+                yield f"data: {to_sse_data(chunk)}\n\n"
                 await asyncio.sleep(0.05)  # Shorter pause for smooth flow
 
             yield "data: [DONE]\n\n"
 
         except Exception as e:
             print(f"❌ Stream error: {e}")
-            yield f"data: ERROR: {str(e)}\n\n"
+            yield f"data: {to_sse_data(f'ERROR: {e}')}\n\n"
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
 

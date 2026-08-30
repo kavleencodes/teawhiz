@@ -52,14 +52,28 @@ async function streamAnswer(text: string, tabId: number) {
       const lines = buffer.split("\n");
 
       for (let i = 0; i < lines.length - 1; i++) {
-        const line = lines[i].trim();
+        // Strip only a trailing CR (CRLF line endings); no other trimming -
+        // leading/trailing whitespace here is meaningful markdown structure
+        // (paragraph breaks, table row breaks) that the backend preserved on
+        // purpose. Don't re-collapse it.
+        const line = lines[i].replace(/\r$/, "");
         if (line.startsWith("data: ")) {
-          const chunk = line.slice(6).trim();
-          if (chunk && chunk !== "[DONE]") {
+          const raw = line.slice(6);
+          if (raw === "[DONE]") continue;
+          // Backend JSON-encodes each chunk (json.dumps) so it survives a
+          // single SSE `data:` line intact, newlines and all. Reverse it.
+          let chunk: string;
+          try {
+            chunk = JSON.parse(raw);
+          } catch (parseError) {
+            console.error("[TeaWhiz] Background: Bad SSE chunk JSON:", raw, parseError);
+            continue;
+          }
+          if (chunk) {
             console.log("[TeaWhiz] Background: Sending chunk:", chunk);
             broadcastResponse({
               type: "RESPONSE_CHUNK",
-              text: chunk + " ",
+              text: chunk,
             });
             chunkCount++;
           }
