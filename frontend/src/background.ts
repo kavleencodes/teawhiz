@@ -4,18 +4,36 @@ const BACKEND_URL = "http://localhost:8000"; // Will update in Phase 6
 
 interface MessageRequest {
   type: string;
-  text: string;
+  content: string;
+  contentType?: "html" | "text";
+  title?: string;
+  question?: string;
 }
 
-// Stream answer from backend in real-time
-async function streamAnswer(text: string, tabId: number) {
+// Stream answer from backend in real-time. `content` is either plain text
+// (Netflix titles, DOM-text fallback) or the page's rendered outerHTML - the
+// backend runs Trafilatura extraction itself when contentType is "html", and
+// combines the result with `title`/`question` server-side.
+async function streamAnswer(
+  content: string,
+  contentType: "html" | "text",
+  title: string,
+  question: string,
+  tabId: number
+) {
   try {
     console.log("[TeaWhiz] Background: Fetching from", `${BACKEND_URL}/explain-stream`);
 
     const response = await fetch(`${BACKEND_URL}/explain-stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, action: "explain" }),
+      body: JSON.stringify({
+        text: content,
+        content_type: contentType,
+        title,
+        question,
+        action: "explain",
+      }),
     });
 
     console.log("[TeaWhiz] Background: Got response status:", response.status);
@@ -103,9 +121,20 @@ chrome.runtime.onMessage.addListener(
   (request: MessageRequest, sender) => {
     console.log("[TeaWhiz] Background: Received message:", request.type);
     if (request.type === "GET_ANSWER") {
-      console.log("[TeaWhiz] Background: Starting stream for text of length:", request.text.length);
+      console.log(
+        "[TeaWhiz] Background: Starting stream for content of length:",
+        request.content.length,
+        "type:",
+        request.contentType
+      );
       // Use streaming for real-time response
-      streamAnswer(request.text, sender.tab?.id || 0);
+      streamAnswer(
+        request.content,
+        request.contentType || "text",
+        request.title || "",
+        request.question || "",
+        sender.tab?.id || 0
+      );
       return true;
     }
   }

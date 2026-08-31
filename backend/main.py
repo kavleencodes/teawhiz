@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from groq import Groq
 from groq import RateLimitError, APIError
+import trafilatura
 
 load_dotenv()
 
@@ -104,10 +105,85 @@ def save_to_cache(text: str, action: str, answer: str):
 class ExplainRequest(BaseModel):
     text: str
     action: str = "explain"
+    # "text": `text` is already clean text (or the Netflix title list, etc).
+    # "html": `text` is the browser's rendered outerHTML (post-JS) - the content
+    # script grabs the DOM *after* the page's own JS has hydrated it, so this
+    # works for SPA/React pages (Netflix, etc.) where a server-side
+    # `requests.get` would only ever see the near-empty initial HTML shell.
+    content_type: str = "text"
+    question: Optional[str] = None  # user's question, appended after extraction
+    title: Optional[str] = None  # page title, prepended before the extracted content
 
 class ExplainResponse(BaseModel):
     answer: str
     cached: bool = False
+
+
+# Guard against pathological SPA payloads (e.g. huge unbounded DOMs) blowing up
+# Trafilatura's parse time / memory.
+MAX_HTML_LENGTH = 2_000_000
+
+
+def extract_clean_text(html: str) -> str:
+    """Runs Trafilatura over browser-rendered HTML to pull out the main content.
+
+    Deliberately does NOT fetch the page itself (no `requests.get` here) -
+    the caller already rendered it in a real browser and handed us the
+    resulting DOM, which is the only way to get real content out of
+    JS-heavy pages.
+    """
+    extracted = trafilatura.extract(
+        html,
+        output_format="markdown",
+        include_tables=True,
+        include_links=False,
+        include_comments=False,
+        favor_recall=True,
+    )
+    return extracted or ""
+
+
+def build_cleaned_text(request: "ExplainRequest") -> str:
+    """Resolves an ExplainRequest down to the plain-text prompt content.
+
+    Handles both content types (raw text, or rendered HTML needing
+    Trafilatura extraction), prepends the optional page title, and appends
+    the optional user question - so both /explain and /explain-stream share
+    one code path. Content and question are handled independently: if page
+    extraction comes back empty (or wasn't attempted) but a question was
+    asked, the question alone is still a valid prompt.
+    """
+    raw = request.text.strip()
+
+    if request.content_type == "html":
+        if not raw:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
+        if len(raw) > MAX_HTML_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Rendered HTML exceeds {MAX_HTML_LENGTH} characters",
+            )
+        content = extract_clean_text(raw)
+        if not content:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Could not extract readable content from the page HTML",
+            )
+    else:
+        content = raw
+
+    title = (request.title or "").strip()
+    if title:
+        content = f"Page Title: {title}\n\nContent:\n{content}" if content else f"Page Title: {title}"
+
+    question = (request.question or "").strip()
+    if question:
+        content = f"{content}\n\n---\n\nUser Question: {question}" if content else f"User Question: {question}"
+
+    if not content.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
+
+    return content
 
 
 
@@ -238,15 +314,13 @@ async def health_check():
 
 @app.post("/explain", response_model=ExplainResponse)
 async def explain(request: ExplainRequest):
-    cleaned_text = request.text.strip()
-    if not cleaned_text:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
-
     if request.action not in ACTION_PROMPTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid action '{request.action}'. Supported: {', '.join(ACTION_PROMPTS.keys())}"
         )
+
+    cleaned_text = build_cleaned_text(request)
 
     # Check cache
     cached_answer, from_cache = get_from_cache(cleaned_text, request.action)
@@ -264,15 +338,13 @@ async def explain(request: ExplainRequest):
 @app.post("/explain-stream")
 async def explain_stream(request: ExplainRequest):
     """Stream response word by word"""
-    cleaned_text = request.text.strip()
-    if not cleaned_text:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
-
     if request.action not in ACTION_PROMPTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid action '{request.action}'. Supported: {', '.join(ACTION_PROMPTS.keys())}"
         )
+
+    cleaned_text = build_cleaned_text(request)
 
     # Check cache
     cached_answer, from_cache = get_from_cache(cleaned_text, request.action)

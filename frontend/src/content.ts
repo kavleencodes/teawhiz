@@ -1,6 +1,13 @@
-import { Readability } from "@mozilla/readability";
-
-const MAX_CONTENT_LENGTH = 8000;
+// Content extraction is now split across two layers:
+//   Browser (this content script) -> Backend (FastAPI + Trafilatura)
+// This script's only job is to hand over the *already-rendered* DOM - after
+// this page's own JS/React/hydration has run - as HTML. Readability-style
+// article extraction happens server-side with Trafilatura instead, because
+// a `requests.get` on the backend would only ever see the pre-render HTML
+// shell for SPA pages (Netflix, React apps, etc). Sending the rendered DOM
+// is what makes those pages work at all.
+const MAX_CONTENT_LENGTH = 8000; // cap for plain-text fallbacks (Netflix titles, body-text fallback)
+const MAX_HTML_LENGTH = 2_000_000; // keep in sync with backend MAX_HTML_LENGTH in main.py
 
 // Netflix content caching
 let latestNetflixContent = "";
@@ -16,69 +23,18 @@ function cleanText(text: string): string {
     .trim();
 }
 
-// Use Readability to extract main content (like Defuddle)
-function extractReadability(): string {
+// Grab the current, post-render DOM as HTML for the backend to run
+// Trafilatura on. Strips script/style tags client-side purely to shrink the
+// payload - Trafilatura ignores them anyway.
+function getRenderedHTML(): string {
   try {
-    // Clone document for Readability (it modifies the DOM)
-    const documentClone = document.cloneNode(true) as Document;
-    const reader = new Readability(documentClone);
-    const article = reader.parse();
-
-    if (article?.content) {
-      // Extract text from HTML, converting structure to markdown-like format
-      const htmlContent = article.content;
-
-      // Convert HTML to text while preserving some structure
-      const tempDiv = document.createElement("div");
-      tempDiv.innerHTML = htmlContent;
-
-      // Extract text with preserved line breaks from block elements
-      const text = extractTextFromHTML(tempDiv);
-      console.log("[TeaWhiz] Readability extraction succeeded, length:", text.length);
-      return cleanText(text);
-    }
+    const clone = document.cloneNode(true) as Document;
+    clone.querySelectorAll("script, style, noscript").forEach((el) => el.remove());
+    return clone.documentElement.outerHTML;
   } catch (error) {
-    console.error("[TeaWhiz] Readability extraction error:", error);
+    console.error("[TeaWhiz] Failed to capture rendered HTML:", error);
+    return "";
   }
-  return "";
-}
-
-// Extract text from HTML while preserving structure (headings, lists, tables, paragraphs)
-function extractTextFromHTML(element: HTMLElement): string {
-  const lines: string[] = [];
-
-  function traverse(node: Node) {
-    if (node.nodeType === Node.TEXT_NODE) {
-      const text = node.textContent?.trim();
-      if (text) {
-        lines.push(text);
-      }
-    } else if (node.nodeType === Node.ELEMENT_NODE) {
-      const el = node as HTMLElement;
-      const tag = el.tagName.toLowerCase();
-
-      // Add line breaks for block elements
-      if (["p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr"].includes(tag)) {
-        lines.push("\n");
-      }
-
-      // Handle table structure
-      if (tag === "table") {
-        lines.push("\n");
-      }
-
-      for (const child of node.childNodes) {
-        traverse(child);
-      }
-
-      if (["p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr", "table"].includes(tag)) {
-        lines.push("\n");
-      }
-    }
-  }
-
-  traverse(element);
-  return lines.join("").replace(/\n{2,}/g, "\n");
 }
 
 // Extract Netflix titles from DOM
@@ -224,43 +180,49 @@ function extractFallback(): string {
   }
 }
 
-function getPageContent(): string {
+interface PageContentResult {
+  title: string;
+  contentType: "html" | "text";
+  content: string;
+}
+
+function getPageContent(): PageContentResult {
   const title = document.title || "No title";
 
-  let textContent = "";
-
-  // Try Netflix extraction first (if on Netflix)
   console.log("[TeaWhiz] Starting content extraction pipeline...");
-  textContent = extractNetflix();
 
-  // If Netflix extraction fails/empty, try Readability
-  if (!textContent || textContent.length < 50) {
-    console.log("[TeaWhiz] Netflix extraction empty, trying Readability...");
-    textContent = extractReadability();
+  // Netflix's UI isn't an "article" - a generic extractor (Trafilatura
+  // included) can't make sense of it, so it keeps its own DOM-scraping path
+  // and is sent to the backend as plain text, unlike everything else below.
+  const netflixContent = extractNetflix();
+  if (netflixContent && netflixContent.length >= 50) {
+    return { title, contentType: "text", content: netflixContent };
   }
 
-  // If Readability fails or returns empty, use DOM fallback
-  if (!textContent || textContent.length < 100) {
-    console.log("[TeaWhiz] Readability failed or too short, using DOM fallback");
-    textContent = extractFallback();
+  // Hand the backend the live, already-rendered DOM. Trafilatura extracts
+  // the main content server-side - this is what makes SPA/React pages work,
+  // since this is the actual post-JS DOM, not a fresh unrendered fetch.
+  const html = getRenderedHTML();
+  if (html && html.length > 0 && html.length <= MAX_HTML_LENGTH) {
+    return { title, contentType: "html", content: html };
   }
 
-  const limitedContent = textContent.substring(0, MAX_CONTENT_LENGTH);
-
-  if (textContent.length > MAX_CONTENT_LENGTH) {
+  if (html.length > MAX_HTML_LENGTH) {
     console.log(
-      `[TeaWhiz] Content truncated from ${textContent.length} to ${MAX_CONTENT_LENGTH} chars`
+      `[TeaWhiz] Rendered HTML too large (${html.length} chars), falling back to DOM text extraction`
     );
   }
 
-  return `Page Title: ${title}\n\nContent:\n${limitedContent}`;
+  // Last resort: plain DOM text (huge pages, or HTML capture failed)
+  const fallbackText = extractFallback().substring(0, MAX_CONTENT_LENGTH);
+  return { title, contentType: "text", content: fallbackText };
 }
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   if (request.type === "GET_PAGE_CONTENT") {
     try {
       const pageContent = getPageContent();
-      sendResponse({ success: true, content: pageContent });
+      sendResponse({ success: true, ...pageContent });
     } catch (error) {
       console.error("[TeaWhiz] Message handler error:", error);
       sendResponse({ success: false, error: String(error) });

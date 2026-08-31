@@ -16,7 +16,14 @@ function expandResponseArea() {
   responseContainer.classList.add("active");
 }
 
+// The content script now hands over the page's own rendered DOM (or, for
+// Netflix/fallback cases, plain text) rather than pre-extracted article
+// text - extraction itself (Trafilatura, for HTML) happens on the backend.
+// So we keep content/contentType/title separate instead of one flattened
+// prompt string; they're combined server-side with the user's question.
 let pageContent = "";
+let pageContentType: "html" | "text" = "text";
+let pageTitle = "";
 const loadingWords = ["boiling", "brewing", "teaying", "sipping", "vibing"];
 let currentLoadingIndex = 0;
 let loadingInterval: any = null;
@@ -37,8 +44,15 @@ async function loadPageContent() {
           console.log("[TeaWhiz] Popup: Got content response:", response);
           if (response?.success) {
             pageContent = response.content;
+            pageContentType = response.contentType === "html" ? "html" : "text";
+            pageTitle = response.title || "";
             promptInput.placeholder = "Ask about this page...";
-            console.log("[TeaWhiz] Popup: Page content loaded, length:", pageContent.length);
+            console.log(
+              "[TeaWhiz] Popup: Page content loaded, type:",
+              pageContentType,
+              "length:",
+              pageContent.length
+            );
           } else {
             console.log("[TeaWhiz] Popup: Content request failed", response);
           }
@@ -195,18 +209,24 @@ function submit() {
   // Show loading animation
   showLoading();
 
-  const fullPrompt = pageContent
-    ? `${pageContent}\n\n---\n\nUser Question: ${userQuestion}`
-    : userQuestion;
-
   console.log("[TeaWhiz] Popup: Sending GET_ANSWER to background", {
     hasPageContent: !!pageContent,
+    pageContentType,
     pageContentLength: pageContent.length,
     userQuestion: userQuestion,
   });
 
+  // Page content and the question travel separately - the backend combines
+  // them (after running Trafilatura extraction, if contentType is "html")
+  // rather than the popup gluing raw HTML and a question into one string.
   chrome.runtime.sendMessage(
-    { type: "GET_ANSWER", text: fullPrompt },
+    {
+      type: "GET_ANSWER",
+      content: pageContent,
+      contentType: pageContentType,
+      title: pageTitle,
+      question: userQuestion,
+    },
     (response) => {
       console.log("[TeaWhiz] Popup: Got callback response:", response);
       stopLoading();
