@@ -22,12 +22,29 @@ app = FastAPI(
 )
 
 
+# Comma-separated list of allowed origins, e.g.
+#   ALLOWED_ORIGINS=chrome-extension://ipdijelcjjejlciopnfipgicdmcpbafj
+# Find your extension's actual id at chrome://extensions (enable Developer
+# mode) - don't trust a computed guess without checking it there.
+# allow_origins=["*"] let ANY website's JS call this backend directly and
+# burn your Groq quota; it isn't needed for a Chrome extension anyway (the
+# only real caller is our own background service worker).
+_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [origin.strip() for origin in _allowed_origins_env.split(",") if origin.strip()]
+
+if not ALLOWED_ORIGINS:
+    print(
+        "⚠️ WARNING: ALLOWED_ORIGINS not set in .env - CORS will reject every "
+        "browser request until you set it to your extension's "
+        "chrome-extension://<id> origin (see chrome://extensions)."
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # no cookies/auth are used, so this isn't needed
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
