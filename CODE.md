@@ -19,6 +19,7 @@
 11. [Case Study: Fixing the Broken FAQ Table](#case-study-fixing-the-broken-faq-table)
 12. [Running the Extension](#running-the-extension)
 13. [Troubleshooting](#troubleshooting)
+14. [Known Weaknesses & Limitations](#known-weaknesses--limitations)
 
 ---
 
@@ -1291,3 +1292,43 @@ webwhiz/
 **Status:** Core functionality complete and tested ✅  
 **Feature Complete:** ✨ Instant responses, beautiful markdown (tables included), Netflix monitoring, server-side Trafilatura extraction on browser-rendered HTML  
 **Next Phase:** Cloud deployment and Chrome Web Store submission
+
+---
+
+## Known Weaknesses & Limitations
+
+An honest list of where the current design is thin - found by re-reading the actual code, not hypothetical. Several of these were introduced or made worse by the recent Trafilatura migration and haven't been addressed yet.
+
+### Performance / Concurrency
+
+| Weakness | Detail |
+|----------|--------|
+| **Trafilatura extraction blocks the event loop** | `build_cleaned_text()` → `extract_clean_text()` → `trafilatura.extract()` is a synchronous, CPU-bound call, but it's invoked directly (`cleaned_text = build_cleaned_text(request)`) inside `async def explain(...)` / `async def explain_stream(...)` - **not** wrapped in `asyncio.to_thread` the way the actual Groq call is. Parsing a large rendered page (up to 2MB of HTML) can stall the single event loop for the whole process, delaying every other in-flight request on that worker. Fix: wrap the extraction call in `asyncio.to_thread`, same pattern already used for `client.chat.completions.create`. |
+| **Extraction re-runs per question, not per page** | The cache key is SHA256 of the *final combined* `action:cleaned_text` (title + extracted content + question). Two different questions about the same page currently re-run Trafilatura from scratch each time, since there's no separate cache keyed on just the raw HTML/extracted content. |
+| **Bigger payload than before** | Sending full rendered `outerHTML` (up to 2,000,000 chars) is much heavier over the wire than the old client-extracted text (capped at 8,000 chars). Slower on weak connections, more data per question. |
+
+### Security / Privacy
+
+| Weakness | Detail |
+|----------|--------|
+| **Wider data-exposure surface** | The old pipeline only ever sent *visible, Readability-extracted article text* off the browser. The new pipeline sends the **entire rendered DOM** (minus `<script>`/`<style>`/`<noscript>`) to the backend, and Trafilatura's output can include text from hidden elements, prefilled form/input values, `aria-*` attributes, and other DOM content a user never intended to share - all of which then also goes to Groq's API. This is a real regression in blast radius for sensitive pages (banking, webmail, internal tools) that hasn't been mitigated (e.g. stripping `<input>`/`<form>` values or `hidden`/`aria-hidden` subtrees before sending). |
+| **CORS is not authentication** | `ALLOWED_ORIGINS` only stops *browser-enforced* cross-origin `fetch()` calls. Anyone who knows the backend URL can call `/explain-stream` directly with `curl` or server-to-server, bypassing CORS entirely and burning Groq quota. There's no API key, token, or rate limit on the backend itself. |
+
+### Reliability / Robustness
+
+| Weakness | Detail |
+|----------|--------|
+| **No fallback when Trafilatura fails** | If `trafilatura.extract()` returns empty, the request just fails with `422` for that page - there's no server-side fallback chain (e.g. try `<article>`/`<main>` selectors, or the raw text) the way the old client pipeline had four stacked fallback layers (Netflix → Readability → selectors → body text). |
+| **Netflix-style handling doesn't generalize** | Only Netflix gets a dedicated extraction path and a `MutationObserver` for dynamically-loaded content. Other heavy-SPA / infinite-scroll sites (X/Twitter, Instagram, YouTube comments, etc.) get neither - they go through generic Trafilatura, which may return sparse or unhelpful results, and the content script only captures **one DOM snapshot** at the moment the popup opens (no re-render capture for anything other than Netflix). |
+| **`FALLBACK_MODEL` and `redis` are declared but unused** | `FALLBACK_MODEL = "allam-2-7b"` is defined and mentioned in a startup log line, but no code path actually calls it - there is no real fallback if the primary Groq model errors or rate-limits past the retry budget. `redis==5.0.1` sits in `requirements.txt`, but the cache is a plain in-process Python `dict` - `redis` isn't imported anywhere. Both look like real infrastructure but aren't wired up. |
+| **In-memory-only cache** | Response cache is a plain dict inside one process: lost on every restart, and won't work correctly if the backend is ever scaled to multiple workers/processes (each would have its own separate cache). |
+
+### Engineering Hygiene
+
+| Weakness | Detail |
+|----------|--------|
+| **`MAX_HTML_LENGTH` is duplicated, not shared** | The same `2_000_000` limit is hand-copied into both `frontend/src/content.ts` and `backend/main.py`, kept in sync only by a code comment ("keep in sync with backend..."). Nothing enforces this at build/test time, so the two can silently drift. |
+| **Zero automated test coverage** | There is no test suite anywhere in the repo (frontend or backend). All verification so far has been manual/ad hoc (e.g. one-off `python3 -c "..."` smoke tests run during development, not committed as repeatable tests). Regressions in `build_cleaned_text()`, `extract_clean_text()`, or the SSE chunking/encoding logic would currently only be caught by hand. |
+| **Extraction only exercised on hand-written test HTML** | The Trafilatura migration has been verified against one synthetic HTML snippet end-to-end, not against a real spread of site types (paywalled articles, infinite-scroll feeds, login-gated pages, non-English content, heavily animated layouts). Real-world extraction quality is currently unverified beyond that. |
+
+None of these are blockers for personal/local use, but they're the honest gap list before wider deployment (cloud hosting, Chrome Web Store, multiple users) mentioned in [Next Steps](#next-steps).

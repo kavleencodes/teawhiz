@@ -177,9 +177,9 @@ clearBtn.addEventListener("click", () => {
 // Submit on button click
 submitBtn.addEventListener("click", submit);
 
-// Submit on Ctrl+Enter
+// Submit on Enter; Shift+Enter inserts a newline instead of submitting
 promptInput.addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+  if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     submit();
   }
@@ -202,6 +202,13 @@ function submit() {
   }
 
   showMessage(userQuestion, "user");
+
+  // Clear the input now that the question has been posted as a message,
+  // so the user isn't left staring at their already-asked question.
+  promptInput.value = "";
+  promptInput.style.height = "auto";
+  chrome.storage.local.set({ savedPrompt: "" });
+  promptInput.focus();
 
   submitBtn.disabled = true;
   submitBtn.textContent = "...";
