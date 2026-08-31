@@ -37,7 +37,7 @@
 - ⚡ **Instant Display**: Responses appear immediately as chunks arrive
 - 💾 **Intelligent Caching**: SHA256-based keys with 7-day TTL
 - 🤖 **Smart Model Selection**: OpenAI GPT-OSS-120B primary, fallback to ALLAM-2-7B
-- 🔄 **Graceful Degradation**: Content extraction has Readability.js + fallback mechanisms
+- 🔄 **Graceful Degradation**: Content extraction runs server-side (Trafilatura) on the browser's own rendered DOM, with a client-side plain-text fallback if HTML capture fails or is too large
 - 📺 **Netflix Monitoring**: Real-time dynamic content detection with MutationObserver
 - 🎨 **Beautiful Markdown**: marked (bundled via npm) rendering with regex fallback for gorgeous formatted responses, tables included
 - 📊 **Clean Tables**: Minimal table styling with subtle dividers (no ugly borders)
@@ -50,7 +50,8 @@
 |-------|-----------|---------|
 | **Frontend Framework** | TypeScript + Vite | Latest |
 | **Extension Plugin** | @crxjs/vite-plugin | v3 |
-| **Content Extraction** | Readability.js (Mozilla) | Latest |
+| **DOM Capture** | Content script (`document.documentElement.outerHTML`, post-render) | Browser native |
+| **Content Extraction** | Trafilatura (Python, runs on the backend) | 2.2.0 |
 | **Markdown Rendering** | marked (bundled via npm, not CDN) | v18.x |
 | **Markdown Fallback** | Regex-based converter (incl. GFM table support) | Custom |
 | **Dynamic Monitoring** | MutationObserver API | Browser native |
@@ -72,11 +73,16 @@
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │           Content Script (content.ts)               │   │
-│  │  • Extracts page content with Readability.js        │   │
+│  │  • Captures the page's own RENDERED DOM             │   │
+│  │    (document.documentElement.outerHTML, post-JS)    │   │
+│  │  • No extraction logic runs here anymore -          │   │
+│  │    Readability.js was removed; Trafilatura on the   │   │
+│  │    backend does that job now (see below)            │   │
 │  │  • Netflix monitoring with MutationObserver         │   │
+│  │    (its own DOM-scraping path, sent as plain text)  │   │
 │  │  • Runs at document_idle (after page fully loads)   │   │
 │  │  • Listens for GET_PAGE_CONTENT messages            │   │
-│  │  • Sends extracted content back to popup            │   │
+│  │  • Replies with { title, contentType, content }     │   │
 │  └──────────────────┬──────────────────────────────────┘   │
 │                     │                                        │
 │                     │ chrome.tabs.sendMessage()              │
@@ -91,16 +97,21 @@
 │  │  • Instant response display (no delay)              │   │
 │  │  • Loading animation with teacup icon               │   │
 │  │  • Accumulates streamed chunks into full response   │   │
+│  │  • Keeps content/contentType/title/question SEPARATE│   │
+│  │    (no longer glues page content + question client- │   │
+│  │    side - the backend combines them after extraction)│  │
 │  │  • Sends GET_ANSWER to background worker            │   │
 │  └──────────────────┬──────────────────────────────────┘   │
 │                     │                                        │
 │                     │ chrome.runtime.sendMessage()           │
-│                     │ (GET_ANSWER with full prompt)          │
+│                     │ (GET_ANSWER: content, contentType,     │
+│                     │  title, question)                      │
 │                     ▼                                        │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │        Background Worker (background.ts)            │   │
 │  │  • Receives GET_ANSWER messages from popup          │   │
 │  │  • Fetches from backend /explain-stream endpoint    │   │
+│  │    with { text, content_type, title, question }     │   │
 │  │  • Streams response chunks back to popup            │   │
 │  │  • Handles error responses (RESPONSE_ERROR)         │   │
 │  │  • Uses chrome.runtime.sendMessage to broadcast    │   │
@@ -111,32 +122,43 @@
                       │ HTTP POST /explain-stream
                       │ (SSE - Server-Sent Events)
                       ▼
-        ┌──────────────────────────────┐
-        │   FastAPI Backend            │
-        │   (http://localhost:8000)    │
-        │                              │
-        │  ┌────────────────────────┐  │
-        │  │ POST /explain-stream   │  │
-        │  │                        │  │
-        │  │ 1. Receive prompt      │  │
-        │  │ 2. Check cache         │  │
-        │  │ 3a. Cache HIT?         │  │
-        │  │     ↓ Stream cached    │  │
-        │  │ 3b. Cache MISS?        │  │
-        │  │     ↓ Call Groq/OpenAI │  │
-        │  │ 4. Stream response     │  │
-        │  │ 5. Save to cache       │  │
-        │  │ 6. Send [DONE] marker  │  │
-        │  └────────────────────────┘  │
-        │                              │
-        │  ┌────────────────────────┐  │
-        │  │ Response Cache         │  │
-        │  │ • SHA256 keys          │  │
-        │  │ • 7-day TTL            │  │
-        │  │ • FIFO eviction        │  │
-        │  │ • Max 5000 entries     │  │
-        │  └────────────────────────┘  │
-        └──────────────┬───────────────┘
+        ┌──────────────────────────────────────┐
+        │   FastAPI Backend                     │
+        │   (http://localhost:8000)             │
+        │                                       │
+        │  ┌─────────────────────────────────┐  │
+        │  │ POST /explain-stream            │  │
+        │  │                                 │  │
+        │  │ 1. Receive { text, content_type,│  │
+        │  │    title, question, action }    │  │
+        │  │ 2. build_cleaned_text():        │  │
+        │  │    a. content_type == "html"?   │  │
+        │  │       → extract_clean_text()    │  │
+        │  │         (Trafilatura extracts   │  │
+        │  │         the main content from   │  │
+        │  │         the RENDERED HTML the   │  │
+        │  │         browser sent - no       │  │
+        │  │         `requests.get()` here,  │  │
+        │  │         so SPA/React pages like │  │
+        │  │         Netflix still work)     │  │
+        │  │    b. Prepend "Page Title: ..." │  │
+        │  │    c. Append "User Question:..."│  │
+        │  │ 3. Check cache on combined text │  │
+        │  │ 4a. Cache HIT? → Stream cached  │  │
+        │  │ 4b. Cache MISS? → Call Groq     │  │
+        │  │ 5. Stream response              │  │
+        │  │ 6. Save to cache                │  │
+        │  │ 7. Send [DONE] marker           │  │
+        │  └─────────────────────────────────┘  │
+        │                                       │
+        │  ┌─────────────────────────────────┐  │
+        │  │ Response Cache                  │  │
+        │  │ • SHA256 keys                   │  │
+        │  │ • 7-day TTL                     │  │
+        │  │ • FIFO eviction                 │  │
+        │  │ • Max 5000 entries              │  │
+        │  └─────────────────────────────────┘  │
+        └──────────────┬────────────────────────┘
                        │
                        ▼
             ┌──────────────────────┐
@@ -147,6 +169,8 @@
             └──────────────────────┘
 ```
 
+**Why extraction moved from the browser to the backend:** the earlier design ran Readability.js *in the content script*, which worked, but meant every future improvement to extraction quality had to ship as an extension update. The tempting alternative - have the backend just `requests.get(url)` the page itself and run Trafilatura on that - was rejected, because for JS-rendered pages (Netflix, React/SPA sites in general) a plain server-side fetch only ever sees the near-empty pre-hydration HTML shell, not the real content. The chosen design keeps the one thing the browser is uniquely positioned to do (run the page's JS and produce a fully hydrated DOM) in the content script, and moves the one thing Python is better at (robust, actively-maintained article extraction via Trafilatura) to the backend - the content script just hands over `outerHTML` after the browser has already rendered it.
+
 ---
 
 ## Current Implementation Status
@@ -154,7 +178,7 @@
 ### ✅ Completed
 - [x] FastAPI backend with Groq/OpenAI API integration
 - [x] Chrome extension manifest v3 structure
-- [x] Content extraction using Readability.js + Netflix monitoring
+- [x] Content extraction: content script forwards the browser's rendered DOM, backend runs Trafilatura on it (Netflix keeps its own dedicated title-scraping path)
 - [x] Popup-based UI (conversation style with message threads)
 - [x] Message passing architecture (content → background → popup)
 - [x] SSE streaming from backend
@@ -165,6 +189,7 @@
 - [x] **Netflix dynamic content monitoring with MutationObserver**
 - [x] **Clean, beautiful markdown styling**
 - [x] **Minimal table design (no borders, subtle dividers)**
+- [x] **Server-side content extraction with Trafilatura** (replaces the earlier client-side Readability.js) - see [Content Extraction Strategy](#content-extraction-strategy)
 - [x] In-memory caching with SHA256 keys and 7-day TTL
 - [x] Error handling and resilience
 - [x] Comprehensive logging at each step
@@ -199,14 +224,24 @@
    - Fallback model: `allam-2-7b`
    - Configuration: Max 5000 cache entries, 7-day TTL
 
-2. **Caching System**
-   - **Key Generation:** SHA256 hash of `action:text` → 64-char hex string
+2. **Content Extraction (`extract_clean_text()` + `build_cleaned_text()`)**
+   - `ExplainRequest` carries `text` (either plain text or rendered HTML), `content_type` (`"text"` | `"html"`), an optional `title`, and an optional `question` - the popup no longer glues page content and the question into one string before sending
+   - `extract_clean_text(html)`: runs `trafilatura.extract()` (`output_format="markdown"`, `include_tables=True`, `favor_recall=True`) on the browser's rendered HTML - see [Content Extraction Strategy](#content-extraction-strategy) for why the HTML has to come from the browser rather than a server-side fetch
+   - `build_cleaned_text(request)`: the shared pipeline both endpoints call:
+     1. If `content_type == "html"`: guards payload size (`413` above `MAX_HTML_LENGTH` = 2,000,000 chars), runs `extract_clean_text()`, and errors `422` if nothing usable comes back
+     2. If `title` is set, prepends `"Page Title: {title}\n\nContent:\n{content}"`
+     3. If `question` is set, appends `"\n\n---\n\nUser Question: {question}"`
+     4. Errors `400` only if the *final combined* text is still empty (so an empty page extraction + a real question is still valid - matches the old behavior of falling back to just the user's question)
+
+3. **Caching System**
+   - **Key Generation:** SHA256 hash of `action:cleaned_text` → 64-char hex string (`cleaned_text` is the fully-combined title+content+question string from `build_cleaned_text()`, not the raw HTML)
    - **Validation:** Checks timestamp age, auto-deletes if >7 days old
    - **Retrieval:** Returns cached answer instantly if valid
    - **Storage:** Saves responses with ISO timestamp
    - **Eviction:** FIFO - removes oldest 500 entries when cache reaches 5000
 
-3. **POST /explain-stream Endpoint**
+4. **POST /explain-stream Endpoint**
+   - Validates `action`, then calls `build_cleaned_text()` (extraction + title/question combination happens here, before caching)
    - Checks cache first (cache hit = instant stream)
    - If cache miss: Calls Groq/OpenAI API
    - Streams response word-by-word via `chunk_preserving_whitespace()` (~15 words/chunk, 50ms delays, real newlines kept intact)
@@ -214,7 +249,7 @@
    - Returns SSE format: `data: <json-encoded chunk>\n\n`
    - Ends with: `data: [DONE]\n\n` marker
 
-4. **GET /health Endpoint**
+5. **GET /health Endpoint**
    - Returns status and Groq API readiness
    - Used for backend verification
 
@@ -239,8 +274,8 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 **Key Settings:**
 - Manifest v3 (latest Chrome extension format)
 - **Background worker:** Handles all backend communication
-- **Content scripts:** Inject Readability.js on all pages
-- **`run_at: "document_idle"`** ⚠️ CRITICAL: Waits for DOM to fully load before extraction (prevents Readability.js crashes)
+- **Content scripts:** Injected on all pages to capture the rendered DOM (no extraction library ships in the extension anymore - that runs server-side)
+- **`run_at: "document_idle"`** ⚠️ CRITICAL: Waits for DOM to fully load/hydrate before capturing `outerHTML`
 - **Action popup:** Shows main UI when extension icon clicked
 - **Icons:** TeaWhiz logo at multiple sizes
 
@@ -248,19 +283,19 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 
 **Location:** `/home/kavleen/Desktop/webwhiz/frontend/src/content.ts`
 
-**Purpose:** Extract main webpage content intelligently with Netflix real-time monitoring
+**Purpose:** Capture the page's rendered DOM for backend extraction, plus Netflix real-time monitoring
 
 **Key Functions:**
-- **`extractReadability()`:** Use Mozilla's Readability library to parse article/main content
-  - Clones document for Readability analysis
-  - Removes ads, navigation, noise automatically
-  - Returns clean text content if extraction succeeds
-  - Converts HTML to text while preserving structure
+- **`getRenderedHTML()`:** Captures the current, post-render DOM
+  - Clones `document`, strips `<script>`/`<style>`/`<noscript>` (pure payload-size trim, Trafilatura ignores them anyway)
+  - Returns `document.documentElement.outerHTML` - this is the browser's own fully-hydrated DOM, not a fresh fetch, which is what makes SPA/React pages (Netflix included) work at all. See [Content Extraction Strategy](#content-extraction-strategy)
+  - Actual article/main-content extraction no longer happens here - it happens backend-side via Trafilatura
 
-- **`extractNetflixTitles()`:** Netflix-specific extraction
+- **`extractNetflixTitles()`:** Netflix-specific extraction (unchanged)
   - Looks for `aria-label` attributes on Netflix elements
   - Filters out UI text ("Play", "Browse", "Menu", etc.)
   - Returns markdown list of show/movie titles
+  - Sent to the backend as `contentType: "text"`, bypassing HTML capture and Trafilatura entirely - a generic extractor can't make sense of Netflix's row-of-thumbnails UI
 
 - **`setupNetflixMonitoring()`:** Real-time Netflix content detection
   - `MutationObserver` watches `document.body` for DOM changes
@@ -268,24 +303,26 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
   - `scheduleNetflixExtraction()` debounces to 1 second (prevents spam on hundreds of mutations)
   - Caches titles in `latestNetflixContent` to avoid redundant extractions
 
-- **`extractFallback()`:** Selector-based extraction if Readability fails
+- **`extractFallback()`:** Selector-based plain-text extraction - now only an emergency fallback for when HTML capture is empty or exceeds `MAX_HTML_LENGTH`
   - Tries: `<article>`, `<main>`, `.main-content`, `.article-content`, etc.
   - Falls back to `document.body.innerText` as last resort
+  - Sent as `contentType: "text"` (skips backend Trafilatura extraction - it's already plain text)
 
-- **`cleanText(text)`:** Markdown-preserving text cleaning
+- **`cleanText(text)`:** Markdown-preserving text cleaning (used only by the Netflix/fallback text paths, not by the HTML path)
   - Only normalizes whitespace (collapse spaces/tabs)
   - Removes leading/trailing spaces on lines
   - Normalizes multiple newlines to double newlines
   - **Preserves markdown syntax:** `**`, `*`, `_`, `|`, `#`, `-`, etc.
 
-- **`getPageContent()`:** Orchestrates extraction pipeline
-  - Priority order: Netflix → Readability → Fallback
-  - Returns cached Netflix content if available
-  - Limits output to MAX_CONTENT_LENGTH (8000 chars)
-  - Includes page title in response
+- **`getPageContent()`:** Orchestrates what gets sent to the backend
+  - Netflix (cached titles, ≥50 chars) → `{ contentType: "text" }`
+  - Otherwise → `getRenderedHTML()`, capped at `MAX_HTML_LENGTH` (2,000,000 chars, kept in sync with the backend's own limit) → `{ contentType: "html" }`
+  - HTML empty or oversized → `extractFallback()`, capped at `MAX_CONTENT_LENGTH` (8000 chars) → `{ contentType: "text" }`
+  - Returns `{ title, contentType, content }` - title and content are no longer flattened into one string here
 
 - **Message Listener:** Responds to `GET_PAGE_CONTENT` messages from popup
   - Synchronous response (no async/await issues)
+  - Replies with `{ success, title, contentType, content }`
   - Includes error handling
 
 ### File: `frontend/src/background.ts`
@@ -295,8 +332,9 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 **Purpose:** Message handler between popup and backend API
 
 **Key Functions:**
-- **`streamAnswer(text)`:** Main handler for AI requests
-  - Fetches from `http://localhost:8000/explain-stream`
+- **`streamAnswer(content, contentType, title, question, tabId)`:** Main handler for AI requests
+  - Fetches from `http://localhost:8000/explain-stream` with `{ text: content, content_type: contentType, title, question, action: "explain" }`
+  - `content` may be plain text or the page's rendered HTML - the backend, not this function, decides whether Trafilatura extraction is needed and combines `title`/`question` into the final prompt
   - Reads SSE stream (Server-Sent Events)
   - Parses `data: <json-encoded chunk>` lines, `JSON.parse()`s the payload (reverses the backend's `json.dumps`) to recover real newlines untouched
   - Does **not** trim or re-space the chunk — whitespace at chunk boundaries is meaningful markdown structure and is forwarded as-is
@@ -308,7 +346,7 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
   - Messages: RESPONSE_CHUNK, RESPONSE_DONE, RESPONSE_ERROR
 
 - **Message Listener:** Catches `GET_ANSWER` from popup
-  - Extracts text from message
+  - Reads `content`, `contentType`, `title`, `question` from the message (no pre-combined `text` field anymore)
   - Calls `streamAnswer()`
   - Returns `true` to keep channel open for async response
 
@@ -321,11 +359,11 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 **Key Functions:**
 - **`loadPageContent()`:** When popup opens, request page content from content script
   - Uses `chrome.tabs.sendMessage()` with GET_PAGE_CONTENT
-  - Stores result in `pageContent` variable
+  - Stores the response across three separate variables: `pageContent`, `pageContentType` (`"html"` | `"text"`), `pageTitle` - no longer flattened into one string
 
 - **`submit()`:** User submits a question
-  - Combines: `pageContent + "\n\n---\n\n" + userQuestion`
-  - Sends to background worker: GET_ANSWER message
+  - Sends `{ content: pageContent, contentType: pageContentType, title: pageTitle, question: userQuestion }` to the background worker as a `GET_ANSWER` message
+  - The popup itself does **not** glue page content and the question together anymore - `build_cleaned_text()` on the backend does that after any needed Trafilatura extraction, so raw HTML never gets a plain-text question string awkwardly appended to it before parsing
   - Shows user message immediately
   - Starts loading animation (teacup with rotating text)
 
@@ -359,11 +397,11 @@ Should see: `INFO: Uvicorn running on http://127.0.0.1:8000`
 ### Step-by-Step Message Flow
 
 1. **Popup Opens** → `loadPageContent()` calls `chrome.tabs.sendMessage(GET_PAGE_CONTENT)`
-2. **Content Script** → Receives message, extracts content via Readability, sends back
-3. **Popup Receives** → Stores `pageContent` variable for later use
-4. **User Submits** → Builds `fullPrompt = pageContent + userQuestion`, sends `GET_ANSWER` to background
-5. **Background** → Receives GET_ANSWER, calls `streamAnswer(text)`, fetches from `/explain-stream`
-6. **Backend** → Checks cache, calls Groq/OpenAI if needed, streams SSE chunks
+2. **Content Script** → Receives message, captures the rendered DOM (`getRenderedHTML()`) or Netflix/fallback plain text - does **not** run any extraction itself, sends `{ title, contentType, content }` back
+3. **Popup Receives** → Stores `pageContent` / `pageContentType` / `pageTitle` separately for later use
+4. **User Submits** → Sends `GET_ANSWER` to background with `{ content: pageContent, contentType: pageContentType, title: pageTitle, question: userQuestion }` (nothing concatenated client-side)
+5. **Background** → Receives GET_ANSWER, calls `streamAnswer(content, contentType, title, question, tabId)`, fetches from `/explain-stream` with `{ text, content_type, title, question, action }`
+6. **Backend** → `build_cleaned_text()` runs Trafilatura extraction if `content_type == "html"`, then prepends the title and appends the question; checks cache on the result, calls Groq/OpenAI if needed, streams SSE chunks
 7. **Background Parses** → Reads SSE stream, extracts chunks, broadcasts via `chrome.runtime.sendMessage()`
 8. **Popup Accumulates** → Catches RESPONSE_CHUNK messages, appends each chunk to `data-raw-text` immediately, and re-renders markdown on every chunk (no artificial delay)
 9. **Complete** → Receives RESPONSE_DONE, removes loading animation, shows full response
@@ -439,32 +477,59 @@ Netflix loads content dynamically as user scrolls and interacts. Content doesn't
 
 ---
 
-## Why NOT Defuddle? → Using Readability.js Instead
+## Content Extraction Strategy
 
 ### Decision History
 
-**Originally Considered:** Defuddle (npm package for text extraction)  
-**Actually Using:** [Mozilla Readability](https://github.com/mozilla/readability) (browser-compatible alternative)
+1. **Originally considered:** Defuddle (Node.js-only, not browser-native - ruled out early)
+2. **Then used:** [Mozilla Readability](https://github.com/mozilla/readability) running *inside the content script*, on the live page's DOM
+3. **Now using:** the content script forwards the browser's **rendered DOM** (`outerHTML`, captured after the page's own JS has run) to the backend, which runs **Trafilatura** (Python) to do the actual article extraction
 
-### Why We Chose Readability.js
+Readability-in-the-browser worked fine, but every extraction-quality improvement meant shipping a new extension build. Moving extraction server-side means it can be tuned/improved without touching the extension at all - the content script's job shrank to "capture the DOM as-is and send it."
 
-| Aspect | Defuddle | Readability.js |
-|--------|----------|----------------|
-| **Type** | Node.js library | Browser library |
-| **Installation** | NPM package | Included in manifest |
-| **Browser Support** | ❌ Not browser-native | ✅ Works in content scripts |
-| **Content Extraction** | Good | ⭐ Excellent (Mozilla-backed) |
-| **Learning Curve** | Higher | Lower |
-| **Performance** | Slower in browser | Faster in browser |
-| **Maintenance** | Less active | Actively maintained by Mozilla |
+### Why not have the backend just fetch the URL itself?
 
-**Result:** Readability.js is the **better choice for Chrome extensions** because it runs natively in the browser without requiring Node.js runtime.
+The obvious-looking simpler design would be:
+
+```
+FastAPI → requests.get(url) → Trafilatura → clean text
+```
+
+This was deliberately **rejected**. A plain server-side `requests.get()` only ever receives the page's *initial* HTML - for a JS-rendered SPA (Netflix, a React app, etc.) that's a near-empty shell; the actual content only exists after the page's own JavaScript runs (hydration, client-side routing, API calls filling in the DOM). The backend has no browser, so it can't render any of that.
+
+The design actually used instead:
+
+```
+Browser (already rendering the page)
+   │  rendered DOM (outerHTML, post-hydration)
+   ▼
+Content Script  →  FastAPI  →  Trafilatura  →  clean text
+```
+
+The browser is doing exactly the JS-execution work it was already doing anyway; the content script just captures the result *after* that work is done and hands it to the backend. Trafilatura then only ever has to parse fully-hydrated HTML, never a pre-render shell - which is what makes this work uniformly for both a static blog post and a React/Netflix-style page.
+
+### Where Trafilatura runs, and on what
+
+| Aspect | Detail |
+|--------|--------|
+| **Runs where** | Backend (`backend/main.py`, `extract_clean_text()`), not the browser |
+| **Input** | The content script's `document.documentElement.outerHTML`, captured post-render (`<script>`/`<style>`/`<noscript>` stripped client-side first, purely to shrink payload size) |
+| **Output format** | `markdown` (`output_format="markdown"`) - preserves headings/lists/tables the same way the old Readability + custom HTML-to-text traversal tried to |
+| **Options** | `include_tables=True`, `include_links=False`, `include_comments=False`, `favor_recall=True` |
+| **Size guard** | Backend rejects (`413`) HTML payloads over `MAX_HTML_LENGTH` (2,000,000 chars); content script also gives up and falls back to plain DOM text client-side above the same threshold, rather than sending a payload it knows will be rejected |
+| **Failure mode** | If Trafilatura returns nothing usable, the backend responds `422 Could not extract readable content from the page HTML` rather than silently sending empty content to the LLM |
+
+### Netflix is a deliberate exception
+
+Trafilatura is built to find "the article" on a page - it has no way to make sense of Netflix's UI (rows of thumbnails, no article body). Netflix keeps its own dedicated path: the content script scrapes `aria-label` attributes via `MutationObserver` (unchanged from before) and sends that back as plain text (`contentType: "text"`), skipping HTML capture and backend extraction entirely for that domain.
 
 ---
 
 ## Text Extraction Pipeline (Complete Flow)
 
 ### High-Level Flow Diagram
+
+This flow now spans **two processes** - the content script only captures, the backend extracts:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -483,66 +548,60 @@ Netflix loads content dynamically as user scrolls and interacts. Content doesn't
                       ▼
         ┌────────────────────────────────────────┐
         │  content.ts: getPageContent()           │
-        │  Executes extraction pipeline          │
+        │  CAPTURE only - no article extraction  │
+        │  happens in the browser anymore        │
         │  (See detailed pipeline below)         │
         └─────────────┬──────────────────────────┘
                       │
                       ▼
         ┌──────────────────────────────────────────────────┐
-        │         EXTRACTION PIPELINE                       │
+        │         CAPTURE PIPELINE (content.ts)             │
         │                                                   │
         │  1️⃣ Check if on Netflix?                         │
         │     → extractNetflix() (cached titles)           │
-        │     → If >50 chars: RETURN with Netflix list     │
+        │     → If >50 chars: RETURN as contentType "text" │
         │                                                   │
-        │  2️⃣ If not Netflix or empty, try Readability    │
-        │     → extractReadability()                       │
-        │     → Clone document                             │
-        │     → Run Mozilla Readability parser             │
-        │     → Extract main article content               │
-        │     → If >100 chars: RETURN cleaned text         │
+        │  2️⃣ Otherwise, capture the rendered DOM          │
+        │     → getRenderedHTML()                           │
+        │     → Clone document, strip script/style/noscript│
+        │     → If non-empty and ≤ MAX_HTML_LENGTH:        │
+        │       RETURN outerHTML as contentType "html"     │
+        │       (Trafilatura extraction happens BACKEND-   │
+        │        SIDE on this - see below)                 │
         │                                                   │
-        │  3️⃣ If Readability fails/empty, try selectors   │
-        │     → extractFallback()                          │
-        │     → Try: <article>, <main>, .main-content     │
-        │     → If found: RETURN content                   │
-        │                                                   │
-        │  4️⃣ Last resort: Full body text                  │
-        │     → document.body.innerText                     │
-        │     → cleanText() to normalize                    │
-        │     → RETURN body content                         │
+        │  3️⃣ HTML empty or too large → fallback           │
+        │     → extractFallback()                           │
+        │     → Try: <article>, <main>, .main-content      │
+        │     → cleanText(), capped at MAX_CONTENT_LENGTH  │
+        │     → RETURN as contentType "text"                │
         │                                                   │
         └────────┬────────────────────────────────────────┘
                  │
                  ▼
         ┌──────────────────────────────────────┐
-        │  cleanText(text)                     │
-        │  Markdown-preserving cleaning:       │
-        │  • Collapse spaces/tabs only         │
-        │  • Remove leading/trailing spaces    │
-        │  • Normalize multiple newlines       │
-        │  • PRESERVE: **, *, _, |, #, -, etc │
+        │  Send { title, contentType, content }│
+        │  back to popup.ts via sendResponse   │
         └──────────────┬───────────────────────┘
                        │
                        ▼
-        ┌──────────────────────────────────────┐
-        │  Limit to MAX_CONTENT_LENGTH (8000)  │
-        │  Format result:                      │
-        │  "Page Title: [title]                │
-        │   Content: [extracted text]"         │
-        └──────────────┬───────────────────────┘
+        ┌──────────────────────────────────────────┐
+        │  popup.ts stores title/contentType/content│
+        │  separately - NOT flattened into one      │
+        │  string. Ready for user to ask a question │
+        └──────────────┬─────────────────────────────┘
                        │
+                       │ (user submits a question - see
+                       │  Complete User Question Flow below)
                        ▼
-        ┌──────────────────────────────────────┐
-        │  Send back to popup.ts via message   │
-        │  Type: Response with .content        │
-        └──────────────┬───────────────────────┘
-                       │
-                       ▼
-        ┌──────────────────────────────────────┐
-        │  popup.ts stores in pageContent var  │
-        │  Ready for user to ask questions     │
-        └──────────────────────────────────────┘
+        ┌──────────────────────────────────────────┐
+        │  backend/main.py: build_cleaned_text()    │
+        │  If contentType == "html":                │
+        │    extract_clean_text() runs Trafilatura  │
+        │    on the rendered HTML - THIS is where   │
+        │    "main content" actually gets pulled    │
+        │    out, not in the browser                │
+        │  Then prepends title, appends question    │
+        └────────────────────────────────────────────┘
 ```
 
 ---
@@ -562,7 +621,7 @@ Is page Netflix?
 │  ├─ Return markdown list: "## 🎬 Netflix Content\n- **Show1**\n- **Show2**"
 │  └─ Cached for instant reuse
 │
-└─ NO → Skip to Readability (next step)
+└─ NO → Skip to DOM capture (next step)
 ```
 
 **Performance:** 
@@ -572,49 +631,55 @@ Is page Netflix?
 
 ---
 
-### Step 2: Readability.js Extraction
+### Step 2: Rendered-DOM Capture (client) → Trafilatura Extraction (backend)
 
-**Function:** `extractReadability()`
+**Function (browser):** `getRenderedHTML()` — **Function (backend):** `extract_clean_text()`
 
 ```
-Clone the document (prevents DOM modification)
+content.ts (browser)                    main.py (backend)
+─────────────────────                   ──────────────────
+Clone the document
         │
         ▼
-Create Readability parser
+Strip <script>/<style>/<noscript>
+(payload-size trim only)
         │
         ▼
-Parse article/content
+outerHTML = document.documentElement
+.outerHTML  (the browser's OWN
+post-JS, post-hydration DOM)
         │
         ▼
-Extract HTML content
-        │
-        ▼
-Convert HTML to clean text (extractTextFromHTML)
-        │
-        ├─ Traverse all nodes
-        ├─ Extract text from TEXT_NODES
-        ├─ Add line breaks for block elements:
-        │  - <p>, <div>, <section>, <article>
-        │  - <h1-h6>, <li>, <tr>, <table>
-        └─ Preserve structure
-        │
-        ▼
-Return clean text (50-8000 chars)
+≤ MAX_HTML_LENGTH?
+        │ yes                          ── sent over HTTP as
+        └──────────────────────────────→  { text: html, content_type: "html" }
+                                                  │
+                                                  ▼
+                                        trafilatura.extract(html,
+                                          output_format="markdown",
+                                          include_tables=True,
+                                          include_links=False,
+                                          include_comments=False,
+                                          favor_recall=True)
+                                                  │
+                                                  ▼
+                                        Non-empty? → clean markdown text
+                                        Empty?     → 422 error (no silent
+                                                     empty-content prompt)
 ```
 
-**What Readability removes:**
-- ❌ Navigation menus
-- ❌ Sidebar ads
-- ❌ Footer links
-- ❌ Script tags and comments
-- ❌ Tracking pixels
-- ✅ Keeps main article/content
+**What this step removes/keeps (via Trafilatura, not Readability):**
+- ❌ Navigation menus, sidebar ads, footer links
+- ❌ Scripts, comments, tracking pixels
+- ✅ Keeps main article/content, headings, lists, tables (as markdown)
+
+Because the HTML comes from the browser's own rendered DOM (not a fresh server fetch), this works the same way for a static blog post and a JS-heavy SPA page.
 
 ---
 
-### Step 3: DOM Selector Fallback
+### Step 3: DOM Selector Fallback (client, plain text)
 
-**Function:** `extractFallback()`
+**Function:** `extractFallback()` — only runs when `getRenderedHTML()` came back empty or over `MAX_HTML_LENGTH`
 
 ```
 Try these selectors in order:
@@ -634,11 +699,13 @@ If no selector matches:
 └─ Use document.body.innerText (full page)
 ```
 
+This is sent to the backend as `contentType: "text"`, so it skips Trafilatura entirely (it's already plain text, not HTML to parse).
+
 ---
 
-### Step 4: Text Cleaning
+### Step 4: Text Cleaning (Netflix / fallback text paths only)
 
-**Function:** `cleanText(text)`
+**Function:** `cleanText(text)` — not applied to the HTML path; Trafilatura's `output_format="markdown"` already produces clean, structured text server-side.
 
 ```
 Input: Raw extracted text
@@ -684,12 +751,16 @@ Output: Clean, readable text
         └─────────────┬──────────────────────┘
                       │
                       ▼
-        ┌────────────────────────────────────┐
-        │  Combine prompt:                   │
-        │  pageContent +                     │
-        │  "\n\n---\n\n" +                   │
-        │  userQuestion                      │
-        └─────────────┬──────────────────────┘
+        ┌────────────────────────────────────────┐
+        │  Send GET_ANSWER with, SEPARATELY:      │
+        │  { content: pageContent,                │
+        │    contentType: pageContentType,        │
+        │    title: pageTitle,                    │
+        │    question: userQuestion }             │
+        │  (no client-side string concatenation - │
+        │   raw HTML never gets a question glued  │
+        │   onto it before the backend parses it) │
+        └─────────────┬────────────────────────────┘
                       │
                       │ chrome.runtime.sendMessage()
                       │ Type: "GET_ANSWER"
@@ -699,25 +770,41 @@ Output: Clean, readable text
         │  Fetch from backend /explain-stream│
         │  Method: POST                      │
         │  Content-Type: application/json    │
+        │  Body: { text: content,            │
+        │    content_type, title, question,  │
+        │    action: "explain" }             │
         └─────────────┬──────────────────────┘
                       │
                       ▼
-        ┌─────────────────────────────────────────┐
-        │        BACKEND (FastAPI)                │
-        │  http://localhost:8000/explain-stream   │
-        │                                         │
-        │  1. Receive prompt + page content      │
-        │  2. Create SHA256 cache key             │
-        │  3. Check cache:                        │
-        │     ✅ HIT → Stream cached response    │
-        │     ❌ MISS → Call Groq/OpenAI API    │
-        │  4. Stream response via SSE (whitespace │
-        │     preserved, JSON-encoded per chunk): │
-        │     data: "chunk1 text..."\n\n          │
-        │     data: "chunk2\\ntext..."\n\n        │
-        │     data: [DONE]\n\n                    │
-        │  5. Save response to cache (7-day TTL) │
-        └─────────────┬───────────────────────────┘
+        ┌───────────────────────────────────────────┐
+        │        BACKEND (FastAPI)                   │
+        │  http://localhost:8000/explain-stream      │
+        │                                            │
+        │  1. Receive { text, content_type, title,  │
+        │     question, action }                     │
+        │  2. build_cleaned_text(request):           │
+        │     a. content_type == "html"?             │
+        │        → extract_clean_text() runs         │
+        │          Trafilatura on the rendered HTML  │
+        │          (413 if > MAX_HTML_LENGTH,        │
+        │           422 if nothing extractable)      │
+        │        else use `text` as-is               │
+        │     b. Prepend "Page Title: {title}"       │
+        │     c. Append "User Question: {question}"  │
+        │        (question alone is still valid if   │
+        │         page content came back empty)      │
+        │  3. Create SHA256 cache key from the        │
+        │     combined result of step 2               │
+        │  4. Check cache:                            │
+        │     ✅ HIT → Stream cached response        │
+        │     ❌ MISS → Call Groq/OpenAI API        │
+        │  5. Stream response via SSE (whitespace     │
+        │     preserved, JSON-encoded per chunk):     │
+        │     data: "chunk1 text..."\n\n              │
+        │     data: "chunk2\\ntext..."\n\n            │
+        │     data: [DONE]\n\n                        │
+        │  6. Save response to cache (7-day TTL)     │
+        └─────────────┬───────────────────────────────┘
                       │
                       │ SSE Stream
                       ▼
@@ -736,7 +823,7 @@ Output: Clean, readable text
         │  popup.ts: Listen for chunks          │
         │  • Append to data-raw-text attribute  │
         │  • renderMarkdown(fullText)           │
-        │    ├─ Try: marked.parse() (CDN)       │
+        │    ├─ Try: marked.parse() (bundled)   │
         │    └─ Fallback: basicMarkdownToHTML() │
         │  • Set innerHTML with rendered HTML   │
         │  • Scroll to bottom                    │
@@ -754,28 +841,27 @@ Output: Clean, readable text
 
 ---
 
-## Summary: No Defuddle, Using Readability.js
+## Summary: Browser Captures, Backend Extracts
 
 ### Why This Choice?
 
 | Factor | Impact |
 |--------|--------|
-| **Defuddle** | Node.js library, not browser-native ❌ |
-| **Readability.js** | Browser-compatible, Mozilla-backed ✅ |
-| **Performance** | Readability faster in extension context ✅ |
-| **Simplicity** | Readability easier to integrate ✅ |
-| **Maintenance** | Mozilla maintains Readability actively ✅ |
+| **Defuddle** | Node.js library, not browser-native - ruled out from the start ❌ |
+| **Readability.js (previous approach)** | Worked, but every extraction-quality tweak required a new extension build ⚠️ |
+| **Server-side fetch + Trafilatura (rejected alternative)** | `requests.get(url)` only sees pre-render HTML - breaks on Netflix/React/SPA pages entirely ❌ |
+| **Rendered HTML → backend Trafilatura (current)** | Extraction logic lives in one place (backend), improvable without shipping extension updates, and still works on SPA pages because the *browser* did the rendering ✅ |
 
 ### What We Extract
 
-1. **Netflix:** Show/movie titles from `aria-label` (real-time monitoring)
-2. **Regular Pages:** Main article content via Readability parser
-3. **Fallback Pages:** Content from common selectors or full body text
-4. **Clean Text:** Markdown-preserving whitespace normalization
+1. **Netflix:** Show/movie titles from `aria-label` (real-time monitoring, unchanged) - sent as plain text, bypasses Trafilatura entirely
+2. **Regular/SPA Pages:** Content script captures `document.documentElement.outerHTML` post-render; backend's `extract_clean_text()` runs Trafilatura on it
+3. **Fallback Pages:** If HTML capture is empty or exceeds `MAX_HTML_LENGTH`, client-side selector/body-text fallback (`extractFallback()`) sent as plain text
+4. **Clean Text:** Trafilatura outputs markdown directly for the HTML path; `cleanText()` still handles whitespace normalization for the Netflix/fallback text paths
 
 ### Result
 
-Clean, readable text content → Sent to LLM with user question → Beautiful markdown response displayed instantly! 🚀
+Rendered DOM (or Netflix/fallback text) → backend combines title + Trafilatura-extracted content + user's question → Sent to LLM → Beautiful markdown response displayed instantly! 🚀
 
 ---
 
@@ -798,7 +884,7 @@ Backend streams responses in SSE format:
 ### Cache Storage Format
 
 Dictionary with SHA256 keys:
-- Key: `hashlib.sha256(f"{action}:{text}")` → 64-char hex
+- Key: `hashlib.sha256(f"{action}:{cleaned_text}")` → 64-char hex, where `cleaned_text` is `build_cleaned_text()`'s output (title + Trafilatura-extracted content + question already combined) - **not** the raw HTML the client sent, so identical page content with different raw markup (or a cache lookup before extraction ever runs) can't produce mismatched keys
 - Value: `{ "answer": "...", "timestamp": "ISO string" }`
 - Max 5000 entries, FIFO eviction, 7-day TTL
 
@@ -1028,6 +1114,19 @@ npm run build
 - ❌ `.env` file missing or empty
 - ✅ Add to `backend/.env`: `GROK_API_KEY=gsk_YOUR_KEY`
 
+**Error: `413 Rendered HTML exceeds ... characters`**
+- ❌ The page's rendered DOM was larger than `MAX_HTML_LENGTH` (2,000,000 chars) and the client sent it anyway
+- ✅ The content script is supposed to catch this itself and fall back to `extractFallback()` plain text before sending - if you see this from the backend, check `content.ts`'s `MAX_HTML_LENGTH` is still in sync with `main.py`'s
+
+**Error: `422 Could not extract readable content from the page HTML`**
+- ❌ Trafilatura ran on the rendered HTML but found nothing it considered main content (very sparse page, or a layout it doesn't recognize as an article)
+- ✅ Not necessarily a bug - some pages genuinely have no "article" for Trafilatura to find. Confirm by testing the same HTML directly: `python3 -c "import trafilatura; print(trafilatura.extract(open('page.html').read()))"`
+- ✅ If this happens often on a specific site, consider adding a dedicated extraction path for it (as was done for Netflix) rather than relying on generic extraction
+
+**Backend fails to import `trafilatura` (`ImportError: lxml.html.clean module is now a separate project`)**
+- ❌ `lxml` ≥ 5 split `lxml.html.clean` into a separate `lxml_html_clean` package, which `justext` (a Trafilatura dependency) still imports directly
+- ✅ Install it: `pip install lxml_html_clean` (already pinned in `backend/requirements.txt`)
+
 ### Frontend Issues
 
 **Extension won't load**
@@ -1039,9 +1138,10 @@ npm run build
 - ✅ Try reloading extension in chrome://extensions
 
 **No page content extracted**
-- ❌ Content script not running
+- ❌ Content script not running, or `getRenderedHTML()` returned nothing
 - ✅ Check DevTools Console → look for `[TeaWhiz] Content script loaded`
 - ✅ Verify `run_at: "document_idle"` in manifest
+- ✅ Check the popup's console for the logged `contentType`/content length from `loadPageContent()` - if `contentType` is `"html"` but the answer looks off-topic, the issue is likely on the backend side (Trafilatura extraction), not the capture step; check the backend logs for a `422`
 
 **Response not appearing**
 - ❌ Backend connection failed (see Network tab)
@@ -1107,9 +1207,9 @@ Should show streaming logs
 ### What We Built
 
 ✅ **Chrome Extension** with beautiful popup UI that:
-- Extracts webpage content intelligently (Readability.js + Netflix monitoring)
+- Captures the page's own rendered DOM (post-JS) for the backend to extract - plus dedicated Netflix real-time monitoring
 - Monitors Netflix in real-time with MutationObserver
-- Sends questions to backend with full page context
+- Sends page content, title, and question to the backend as separate fields (no client-side prompt-gluing)
 - Displays streaming responses instantly (no 5-second delay)
 - Shows beautiful markdown formatting (headers, bold, code, tables)
 - Renders tables cleanly without ugly borders
@@ -1117,10 +1217,11 @@ Should show streaming logs
 - Supports multiple questions and conversation history
 
 ✅ **FastAPI Backend** that:
+- Runs Trafilatura on the browser's rendered HTML to extract main content ([Content Extraction Strategy](#content-extraction-strategy)) - the key reason SPA/React pages like Netflix work at all, since it never does its own `requests.get()`
 - Integrates with Groq/OpenAI APIs
 - Caches responses (7-day TTL)
 - Streams responses via SSE
-- Handles errors gracefully
+- Handles errors gracefully (including `413`/`422` for oversized or unextractable HTML)
 - Validates inputs
 
 ✅ **Message Architecture** that:
@@ -1144,14 +1245,14 @@ webwhiz/
 ├── CODE.md (← You are here)
 ├── code.md (Quick reference guide)
 ├── backend/
-│   ├── main.py (FastAPI backend)
-│   ├── requirements.txt
+│   ├── main.py (FastAPI backend + Trafilatura extraction)
+│   ├── requirements.txt (now includes trafilatura, lxml_html_clean)
 │   ├── .env (API keys)
 │   └── venv/
 ├── frontend/
 │   ├── src/
 │   │   ├── manifest.json (Extension config v3)
-│   │   ├── content.ts (Content extraction + Netflix monitoring)
+│   │   ├── content.ts (Rendered-DOM capture + Netflix monitoring - no extraction library)
 │   │   ├── background.ts (Message handler)
 │   │   ├── popup.ts (UI, streaming, markdown rendering)
 │   │   └── popup.html (UI structure & styling)
@@ -1163,6 +1264,7 @@ webwhiz/
 
 ### Recent Updates (Latest Session)
 
+🔀 **Content extraction moved from client-side Readability.js to server-side Trafilatura** - the content script now only captures the browser's rendered DOM (`outerHTML`, post-hydration) and forwards it; `backend/main.py`'s `extract_clean_text()`/`build_cleaned_text()` do the actual extraction, plus combine title/question server-side instead of the popup gluing strings together. Deliberately still avoids having the backend fetch URLs itself (`requests.get`), since that would break on SPA/React pages like Netflix - see [Content Extraction Strategy](#content-extraction-strategy). `@mozilla/readability` dependency removed.  
 🐛 **Fixed markdown tables rendering as literal pipe text** - see [Case Study](#case-study-fixing-the-broken-faq-table) for the full three-bug investigation  
 📦 **`marked` bundled via npm instead of CDN** - required for Manifest V3 compliance, and was silently failing before  
 🔧 **SSE streaming now preserves whitespace** - `chunk_preserving_whitespace()` + JSON-encoded (`json.dumps`/`JSON.parse`) chunks replace the old whitespace-collapsing `split()`/`join()` logic  
@@ -1185,7 +1287,7 @@ webwhiz/
 
 ---
 
-**Last Updated:** August 30, 2026  
+**Last Updated:** August 31, 2026  
 **Status:** Core functionality complete and tested ✅  
-**Feature Complete:** ✨ Instant responses, beautiful markdown (tables included), Netflix monitoring  
+**Feature Complete:** ✨ Instant responses, beautiful markdown (tables included), Netflix monitoring, server-side Trafilatura extraction on browser-rendered HTML  
 **Next Phase:** Cloud deployment and Chrome Web Store submission
