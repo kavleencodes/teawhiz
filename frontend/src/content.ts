@@ -100,18 +100,42 @@ function scheduleNetflixExtraction() {
 function extractNetflix(): string {
   const isNetflix = document.location.hostname.includes("netflix");
 
-  if (!isNetflix) {
-    console.log("[TeaWhiz] Not on Netflix");
-    return "";
+  if (!isNetflix) return "";
+
+  const liveContent = extractNetflixTitles();
+
+  if (liveContent && liveContent.trim().length > 0) {
+    latestNetflixContent = liveContent;
+
+    console.log(
+      "[TeaWhiz] Extracted Netflix content live. Characters:",
+      liveContent.length
+    );
+
+    console.log(
+      "[TeaWhiz] LIVE NETFLIX CONTENT:",
+      liveContent
+    );
+
+    return liveContent;
   }
 
-  // Return cached content if available
-  if (latestNetflixContent) {
-    console.log("[TeaWhiz] Using cached Netflix content");
+  if (latestNetflixContent && latestNetflixContent.trim().length > 0) {
+    console.log(
+      "[TeaWhiz] Using cached Netflix content. Characters:",
+      latestNetflixContent.length
+    );
+
+    console.log(
+      "[TeaWhiz] CACHED NETFLIX CONTENT:",
+      latestNetflixContent
+    );
+
     return latestNetflixContent;
   }
 
-  console.log("[TeaWhiz] No cached Netflix content yet");
+  console.log("[TeaWhiz] No Netflix content available");
+
   return "";
 }
 
