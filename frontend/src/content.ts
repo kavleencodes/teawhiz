@@ -65,8 +65,15 @@ function extractNetflixTitles(): string {
     }
 
     if (titles.length > 0) {
+      // No small cap here on purpose: a homepage has many rows (Top 10, US TV
+      // Shows, Japanese Movies & TV, etc.) stacked in DOM order, and an early
+      // cap silently drops whole categories that render further down before
+      // the user ever asks about them. Netflix content also isn't truncated
+      // downstream (unlike the generic HTML/fallback paths), so the full list
+      // reaches the model. Still bounded generously so a pathological page
+      // (hundreds of stray aria-label elements) can't blow up the payload.
       const listContent = titles
-        .slice(0, 25)
+        .slice(0, 300)
         .map((title) => `- **${title}**`)
         .join("\n");
 
