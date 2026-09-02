@@ -8,6 +8,7 @@ interface MessageRequest {
   contentType?: "html" | "text";
   title?: string;
   question?: string;
+  word?: string;
 }
 
 // Stream answer from backend in real-time. `content` is either plain text
@@ -108,6 +109,25 @@ async function streamAnswer(
   }
 }
 
+// Live, as-you-type word correction (triggered on space-bar press in the
+// popup's input). Independent of streamAnswer/GET_ANSWER - no LLM involved,
+// just one fast local-dictionary lookup on the backend, and it's a plain
+// request/response, not a stream.
+async function normalizeWord(word: string): Promise<string> {
+  const response = await fetch(`${BACKEND_URL}/normalize-query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: word }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.normalized_query as string;
+}
+
 // Broadcast response to all listeners (popup will receive it)
 function broadcastResponse(message: any) {
   chrome.runtime.sendMessage(message).catch(() => {
@@ -118,7 +138,7 @@ function broadcastResponse(message: any) {
 
 // Handle messages from popup
 chrome.runtime.onMessage.addListener(
-  (request: MessageRequest, sender) => {
+  (request: MessageRequest, sender, sendResponse) => {
     console.log("[TeaWhiz] Background: Received message:", request.type);
     if (request.type === "GET_ANSWER") {
       console.log(
@@ -136,6 +156,16 @@ chrome.runtime.onMessage.addListener(
         sender.tab?.id || 0
       );
       return true;
+    }
+
+    if (request.type === "NORMALIZE_WORD") {
+      normalizeWord(request.word || "")
+        .then((normalized) => sendResponse({ success: true, normalized }))
+        .catch((error) => {
+          console.log("[TeaWhiz] Background: word normalize failed", error);
+          sendResponse({ success: false, error: String(error) });
+        });
+      return true; // keep the message channel open for the async sendResponse
     }
   }
 );

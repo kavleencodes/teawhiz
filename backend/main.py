@@ -15,6 +15,8 @@ from groq import Groq
 from groq import RateLimitError, APIError
 import trafilatura
 
+from query_normalizer import normalize_query
+
 load_dotenv()
 
 app = FastAPI(
@@ -48,6 +50,21 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
+
+
+# Query Normalizer feature flag - local, LLM-free spell correction for the
+# user's typed question (see query_normalizer.py for the "why no LLM").
+#   off    - disabled entirely (default): zero normalization overhead.
+#   shadow - normalize and log original vs. corrected for comparison, but
+#            still send the user's original (uncorrected) question to the
+#            LLM. Use this to build confidence before flipping to active.
+#   active - actually send the normalized question to the LLM.
+# Roll out shadow -> active only after shadow-mode logs show it isn't
+# mangling real queries.
+QUERY_NORMALIZER_MODE = os.getenv("QUERY_NORMALIZER_MODE", "off").strip().lower()
+if QUERY_NORMALIZER_MODE not in ("off", "shadow", "active"):
+    print(f"⚠️ WARNING: invalid QUERY_NORMALIZER_MODE={QUERY_NORMALIZER_MODE!r} - defaulting to 'off'")
+    QUERY_NORMALIZER_MODE = "off"
 
 
 GROQ_API_KEY = os.getenv("GROK_API_KEY")
@@ -119,6 +136,19 @@ class ExplainResponse(BaseModel):
     cached: bool = False
 
 
+class NormalizeRequest(BaseModel):
+    text: str  # a single word (or short fragment) - sent on every space-bar
+    # press while the user types their question in the popup. Kept as its
+    # own request/response pair, separate from ExplainRequest, so this never
+    # touches the LLM or the answer cache.
+
+
+class NormalizeResponse(BaseModel):
+    original_query: str
+    normalized_query: str
+    corrected: bool
+
+
 # Guard against pathological SPA payloads (e.g. huge unbounded DOMs) blowing up
 # Trafilatura's parse time / memory.
 MAX_HTML_LENGTH = 2_000_000
@@ -141,6 +171,37 @@ def extract_clean_text(html: str) -> str:
         favor_recall=True,
     )
     return extracted or ""
+
+
+def resolve_question(question: str) -> str:
+    """Returns the question text to actually put in the LLM prompt, honoring
+    QUERY_NORMALIZER_MODE. Always logs any correction found (in both shadow
+    and active mode) so shadow-mode behavior is actually observable before
+    flipping the flag - that's the whole point of having a shadow mode.
+
+    `question` itself is never mutated - this only ever returns a new string
+    for the caller to use, per query_normalizer's "never destroy the user's
+    original input" rule.
+    """
+    if QUERY_NORMALIZER_MODE == "off" or not question:
+        return question
+
+    result = normalize_query(question)
+    if result.changed:
+        for correction in result.corrections:
+            print(
+                f"[QueryNormalizer:{QUERY_NORMALIZER_MODE}] "
+                f"'{correction.original_word}' -> '{correction.corrected_word}' "
+                f"(confidence={correction.confidence}, edit_distance={correction.edit_distance})"
+            )
+        print(
+            f"[QueryNormalizer:{QUERY_NORMALIZER_MODE}] "
+            f"original_query={result.original_query!r} normalized_query={result.normalized_query!r}"
+        )
+
+    if QUERY_NORMALIZER_MODE == "active":
+        return result.normalized_query
+    return question  # shadow mode: logged above, original still used downstream
 
 
 def build_cleaned_text(request: "ExplainRequest") -> str:
@@ -178,6 +239,7 @@ def build_cleaned_text(request: "ExplainRequest") -> str:
 
     question = (request.question or "").strip()
     if question:
+        question = resolve_question(question)
         content = f"{content}\n\n---\n\nUser Question: {question}" if content else f"User Question: {question}"
 
     if not content.strip():
@@ -311,6 +373,23 @@ async def health_check():
         "service": "TeaWhiz AI API (Groq)",
         "groq_ready": client is not None
     }
+
+@app.post("/normalize-query", response_model=NormalizeResponse)
+async def normalize_query_endpoint(request: NormalizeRequest):
+    """Live, as-you-type spell correction for the popup's question input -
+    called on every space-bar press, independent of QUERY_NORMALIZER_MODE
+    (that flag only gates whether the *submitted* question is silently
+    corrected before going to the LLM; this endpoint is the explicit,
+    visible-to-the-user typing-assist feature and is always on). No LLM
+    involved - the same local SymSpell lookup `resolve_question()` uses.
+    """
+    result = normalize_query(request.text)
+    return NormalizeResponse(
+        original_query=result.original_query,
+        normalized_query=result.normalized_query,
+        corrected=result.changed,
+    )
+
 
 @app.post("/explain", response_model=ExplainResponse)
 async def explain(request: ExplainRequest):

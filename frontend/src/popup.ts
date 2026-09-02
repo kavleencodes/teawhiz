@@ -177,11 +177,61 @@ clearBtn.addEventListener("click", () => {
 // Submit on button click
 submitBtn.addEventListener("click", submit);
 
+// Live, as-you-type word correction (triggered on space-bar press) -
+// mirrors what phone keyboards/search boxes do: fix the word you just
+// finished typing the moment you hit space. Deliberately doesn't block or
+// delay the space itself (see the keydown handler below) - only fast,
+// local, non-LLM correction (query_normalizer.py on the backend) is cheap
+// enough to run on every single space press.
+let normalizeSeq = 0;
+
+function requestWordCorrection(word: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "NORMALIZE_WORD", word }, (response) => {
+      if (chrome.runtime.lastError || !response?.success) {
+        resolve(null); // backend unreachable, or normalization failed - leave the word as typed
+        return;
+      }
+      resolve(response.normalized as string);
+    });
+  });
+}
+
 // Submit on Enter; Shift+Enter inserts a newline instead of submitting
 promptInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     submit();
+    return;
+  }
+
+  if (e.key === " " && promptInput.selectionStart === promptInput.selectionEnd) {
+    const cursor = promptInput.selectionStart ?? promptInput.value.length;
+    const wordMatch = promptInput.value.slice(0, cursor).match(/([A-Za-z']+)$/);
+    if (!wordMatch) return; // nothing word-like right before the cursor
+
+    const word = wordMatch[1];
+    const wordStart = cursor - word.length;
+    const seq = ++normalizeSeq;
+
+    // No preventDefault, no await here on purpose - the space (and anything
+    // typed after it) appears immediately, exactly like normal typing. The
+    // correction only ever swaps the word that's already behind the cursor
+    // once it comes back; it never blocks input.
+    requestWordCorrection(word).then((corrected) => {
+      if (seq !== normalizeSeq) return; // a newer space press superseded this one
+      if (!corrected || corrected === word) return;
+      // Re-check the word is still exactly where we found it - the user may
+      // have kept typing further on (fine, unaffected) or edited/deleted
+      // this exact range while the request was in flight (then skip rather
+      // than guess and corrupt unrelated text).
+      if (promptInput.value.slice(wordStart, wordStart + word.length) !== word) return;
+
+      promptInput.setRangeText(corrected, wordStart, wordStart + word.length, "preserve");
+      // setRangeText doesn't fire an `input` event - replay the existing
+      // autosize/save listener manually so it stays in sync.
+      promptInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
   }
 });
 
