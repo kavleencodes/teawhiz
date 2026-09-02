@@ -204,7 +204,7 @@ def resolve_question(question: str) -> str:
     return question  # shadow mode: logged above, original still used downstream
 
 
-def build_cleaned_text(request: "ExplainRequest") -> str:
+async def build_cleaned_text(request: "ExplainRequest") -> str:
     """Resolves an ExplainRequest down to the plain-text prompt content.
 
     Handles both content types (raw text, or rendered HTML needing
@@ -213,6 +213,12 @@ def build_cleaned_text(request: "ExplainRequest") -> str:
     one code path. Content and question are handled independently: if page
     extraction comes back empty (or wasn't attempted) but a question was
     asked, the question alone is still a valid prompt.
+
+    Trafilatura's parse is synchronous/CPU-bound and can take a while on
+    large pages, so it's offloaded to a worker thread via `asyncio.to_thread`
+    - otherwise it would block the single asyncio event loop for the whole
+    process (stalling every other in-flight request, including other users'
+    SSE streams) for as long as parsing takes.
     """
     raw = request.text.strip()
 
@@ -224,7 +230,7 @@ def build_cleaned_text(request: "ExplainRequest") -> str:
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail=f"Rendered HTML exceeds {MAX_HTML_LENGTH} characters",
             )
-        content = extract_clean_text(raw)
+        content = await asyncio.to_thread(extract_clean_text, raw)
         if not content:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -399,7 +405,7 @@ async def explain(request: ExplainRequest):
             detail=f"Invalid action '{request.action}'. Supported: {', '.join(ACTION_PROMPTS.keys())}"
         )
 
-    cleaned_text = build_cleaned_text(request)
+    cleaned_text = await build_cleaned_text(request)
 
     # Check cache
     cached_answer, from_cache = get_from_cache(cleaned_text, request.action)
@@ -423,7 +429,7 @@ async def explain_stream(request: ExplainRequest):
             detail=f"Invalid action '{request.action}'. Supported: {', '.join(ACTION_PROMPTS.keys())}"
         )
 
-    cleaned_text = build_cleaned_text(request)
+    cleaned_text = await build_cleaned_text(request)
 
     # Check cache
     cached_answer, from_cache = get_from_cache(cleaned_text, request.action)
@@ -436,22 +442,23 @@ async def explain_stream(request: ExplainRequest):
             yield "data: [DONE]\n\n"
         return StreamingResponse(stream_cached(), media_type="text/event-stream")
 
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GROK_API_KEY is not configured on the server"
+        )
+
     # Get response from Groq and stream it
     async def stream_response():
         try:
             template = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"])
             prompt = template.format(text=cleaned_text)
 
-            # Get full response from Groq
-            response = await asyncio.to_thread(
-                client.chat.completions.create,
-                model=PRIMARY_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=2048
-            )
-
-            full_response = response.choices[0].message.content
+            # Get full response from Groq, with the same rate-limit
+            # retry/backoff used by the non-streaming /explain path - without
+            # this, a transient 429 fails the whole streamed answer instead
+            # of transparently retrying.
+            full_response = await _call_groq_with_retry(PRIMARY_MODEL, prompt)
             save_to_cache(cleaned_text, request.action, full_response)
 
             # Stream it in word chunks (like Claude)
@@ -461,6 +468,9 @@ async def explain_stream(request: ExplainRequest):
 
             yield "data: [DONE]\n\n"
 
+        except RateLimitError as e:
+            print(f"⚠️ Rate limit exceeded: {e}")
+            yield f"data: {to_sse_data('ERROR: Rate limit reached. Please try again later.')}\n\n"
         except Exception as e:
             print(f"❌ Stream error: {e}")
             yield f"data: {to_sse_data(f'ERROR: {e}')}\n\n"
