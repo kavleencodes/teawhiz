@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from groq import Groq
 from groq import RateLimitError, APIError
@@ -119,8 +119,25 @@ def save_to_cache(text: str, action: str, answer: str):
 
 
 
+# Guard against pathological/malicious payloads (huge unbounded DOMs, or -
+# since CORS is not authentication, see Known Weaknesses in CODE.md -
+# anyone who finds this backend URL sending an oversized `text`/`question`/
+# `title` straight into a cached, billed Groq prompt). Enforced by Pydantic
+# at the request-body validation layer, so an over-limit request never even
+# reaches a route handler: FastAPI returns 422 automatically.
+#
+# MAX_HTML_LENGTH previously only guarded `content_type == "html"` payloads
+# (checked manually further down); plain `text` content, `question`, and
+# `title` had no limit at all. It's the same value used for `text` here
+# regardless of content_type, so it now also covers the html size guard
+# that used to be a separate manual check.
+MAX_HTML_LENGTH = 2_000_000
+MAX_QUESTION_LENGTH = 2_000  # a typed question is a sentence or two, not an essay
+MAX_TITLE_LENGTH = 500  # page <title> values are short; generous headroom either way
+
+
 class ExplainRequest(BaseModel):
-    text: str
+    text: str = Field(..., max_length=MAX_HTML_LENGTH)
     action: str = "explain"
     # "text": `text` is already clean text (or the Netflix title list, etc).
     # "html": `text` is the browser's rendered outerHTML (post-JS) - the content
@@ -128,8 +145,8 @@ class ExplainRequest(BaseModel):
     # works for SPA/React pages (Netflix, etc.) where a server-side
     # `requests.get` would only ever see the near-empty initial HTML shell.
     content_type: str = "text"
-    question: Optional[str] = None  # user's question, appended after extraction
-    title: Optional[str] = None  # page title, prepended before the extracted content
+    question: Optional[str] = Field(default=None, max_length=MAX_QUESTION_LENGTH)  # user's question, appended after extraction
+    title: Optional[str] = Field(default=None, max_length=MAX_TITLE_LENGTH)  # page title, prepended before the extracted content
 
 class ExplainResponse(BaseModel):
     answer: str
@@ -147,11 +164,6 @@ class NormalizeResponse(BaseModel):
     original_query: str
     normalized_query: str
     corrected: bool
-
-
-# Guard against pathological SPA payloads (e.g. huge unbounded DOMs) blowing up
-# Trafilatura's parse time / memory.
-MAX_HTML_LENGTH = 2_000_000
 
 
 def extract_clean_text(html: str) -> str:
@@ -225,11 +237,11 @@ async def build_cleaned_text(request: "ExplainRequest") -> str:
     if request.content_type == "html":
         if not raw:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
-        if len(raw) > MAX_HTML_LENGTH:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"Rendered HTML exceeds {MAX_HTML_LENGTH} characters",
-            )
+        # No manual length check here anymore - `ExplainRequest.text`'s
+        # `Field(max_length=MAX_HTML_LENGTH)` already rejects an over-limit
+        # payload at the request-body validation layer (a clean 422 before
+        # this function ever runs), so a redundant check here would be dead
+        # code that could never actually trigger.
         content = await asyncio.to_thread(extract_clean_text, raw)
         if not content:
             raise HTTPException(
