@@ -37,7 +37,7 @@
 - 🚀 **Streaming Responses**: Word-by-word delivery via Server-Sent Events (SSE)
 - ⚡ **Instant Display**: Responses appear immediately as chunks arrive
 - 💾 **Intelligent Caching**: SHA256-based keys with 7-day TTL
-- 🤖 **Smart Model Selection**: OpenAI GPT-OSS-120B primary, fallback to ALLAM-2-7B
+- 🤖 **Smart Model Selection**: OpenAI GPT-OSS-120B primary, with automatic failover to ALLAM-2-7B and rate-limit retry/backoff on both `/explain` and `/explain-stream`
 - 🔄 **Graceful Degradation**: Content extraction runs server-side (Trafilatura) on the browser's own rendered DOM, with a client-side plain-text fallback if HTML capture fails or is too large
 - 📺 **Netflix Monitoring**: Real-time dynamic content detection with MutationObserver
 - 🎨 **Beautiful Markdown**: marked (bundled via npm) rendering with regex fallback for gorgeous formatted responses, tables included
@@ -192,6 +192,8 @@
 - [x] **Minimal table design (no borders, subtle dividers)**
 - [x] **Server-side content extraction with Trafilatura** (replaces the earlier client-side Readability.js) - see [Content Extraction Strategy](#content-extraction-strategy)
 - [x] In-memory caching with SHA256 keys and 7-day TTL
+- [x] **Async-safe extraction** - Trafilatura's CPU-bound parse runs via `asyncio.to_thread`, no longer blocks the event loop (see [Known Weaknesses](#known-weaknesses--limitations))
+- [x] **Rate-limit retry + model fallback on `/explain-stream`** - `_call_groq_with_fallback()` shares the same retry/backoff as `/explain`, then falls back to `FALLBACK_MODEL` if the primary model is still unavailable
 - [x] Error handling and resilience
 - [x] Comprehensive logging at each step
 - [x] Loading animation with teacup icon and rotating text
@@ -222,12 +224,13 @@
 1. **FastAPI Setup**
    - Creates Groq API client with `GROK_API_KEY` from `.env`
    - Primary model: `openai/gpt-oss-120b` (changed for better quality)
-   - Fallback model: `allam-2-7b`
+   - Fallback model: `allam-2-7b` - actually wired up via `_call_groq_with_fallback()` (`main.py:332`): tries `PRIMARY_MODEL` with its own retry/backoff first, and only falls back to `FALLBACK_MODEL` (with one retry of its own) if the primary is still rate-limited or hard-erroring
    - Configuration: Max 5000 cache entries, 7-day TTL
 
 2. **Content Extraction (`extract_clean_text()` + `build_cleaned_text()`)**
    - `ExplainRequest` carries `text` (either plain text or rendered HTML), `content_type` (`"text"` | `"html"`), an optional `title`, and an optional `question` - the popup no longer glues page content and the question into one string before sending
    - `extract_clean_text(html)`: runs `trafilatura.extract()` (`output_format="markdown"`, `include_tables=True`, `favor_recall=True`) on the browser's rendered HTML - see [Content Extraction Strategy](#content-extraction-strategy) for why the HTML has to come from the browser rather than a server-side fetch
+   - `build_cleaned_text(request)` is `async` and calls `extract_clean_text()` via `await asyncio.to_thread(...)` - Trafilatura's parse is synchronous/CPU-bound, so running it inline used to stall FastAPI's single asyncio event loop for the whole process on large pages (see [Known Weaknesses](#known-weaknesses--limitations)); it's now offloaded to a worker thread the same way the Groq call already was
    - `build_cleaned_text(request)`: the shared pipeline both endpoints call:
      1. If `content_type == "html"`: guards payload size (`413` above `MAX_HTML_LENGTH` = 2,000,000 chars), runs `extract_clean_text()`, and errors `422` if nothing usable comes back
      2. If `title` is set, prepends `"Page Title: {title}\n\nContent:\n{content}"`
@@ -244,7 +247,7 @@
 4. **POST /explain-stream Endpoint**
    - Validates `action`, then calls `build_cleaned_text()` (extraction + title/question combination happens here, before caching)
    - Checks cache first (cache hit = instant stream)
-   - If cache miss: Calls Groq/OpenAI API
+   - If cache miss: Calls Groq/OpenAI API via `_call_groq_with_fallback()` - same rate-limit retry/backoff and primary→fallback-model behavior as `/explain` (previously this endpoint called Groq directly with zero resilience)
    - Streams response word-by-word via `chunk_preserving_whitespace()` (~15 words/chunk, 50ms delays, real newlines kept intact)
    - Each chunk is JSON-encoded with `to_sse_data()` (`json.dumps`) before being written to the SSE line, so markdown structure (blank lines, table rows) survives transport
    - Returns SSE format: `data: <json-encoded chunk>\n\n`
@@ -1263,6 +1266,13 @@ webwhiz/
 │   └── dist/ (← Load unpacked from here)
 ```
 
+### Recent Updates (Reliability Session)
+
+🔧 **Fixed Trafilatura blocking the event loop** - `build_cleaned_text()` is now `async` and runs extraction via `asyncio.to_thread`, matching the pattern already used for the Groq call - see [Known Weaknesses](#known-weaknesses--limitations)
+🔁 **Added retry/backoff + model fallback to `/explain-stream`** - previously only `/explain` had rate-limit resilience; both endpoints now share `_call_groq_with_fallback()`
+🤖 **Wired up `FALLBACK_MODEL`** - `allam-2-7b` is now a real fallback if the primary model (`openai/gpt-oss-120b`) is rate-limited past its retry budget or hard-errors
+🧹 **Removed the unused `redis` dependency** - it was never imported anywhere; the cache is (and remains) an in-process dict
+
 ### Recent Updates (Latest Session)
 
 🔀 **Content extraction moved from client-side Readability.js to server-side Trafilatura** - the content script now only captures the browser's rendered DOM (`outerHTML`, post-hydration) and forwards it; `backend/main.py`'s `extract_clean_text()`/`build_cleaned_text()` do the actual extraction, plus combine title/question server-side instead of the popup gluing strings together. Deliberately still avoids having the backend fetch URLs itself (`requests.get`), since that would break on SPA/React pages like Netflix - see [Content Extraction Strategy](#content-extraction-strategy). `@mozilla/readability` dependency removed.  
@@ -1288,31 +1298,41 @@ webwhiz/
 
 ---
 
-**Last Updated:** August 31, 2026  
+**Last Updated:** September 3, 2026  
 **Status:** Core functionality complete and tested ✅  
-**Feature Complete:** ✨ Instant responses, beautiful markdown (tables included), Netflix monitoring, server-side Trafilatura extraction on browser-rendered HTML  
-**Next Phase:** Cloud deployment and Chrome Web Store submission
+**Feature Complete:** ✨ Instant responses, beautiful markdown (tables included), Netflix monitoring, server-side Trafilatura extraction on browser-rendered HTML, async-safe extraction, rate-limit retry + model fallback on both endpoints  
+**Next Phase:** Cloud deployment and Chrome Web Store submission (see [Known Weaknesses](#known-weaknesses--limitations) for the gap list to work through first)
 
 ---
 
 ## Known Weaknesses & Limitations
 
-An honest list of where the current design is thin - found by re-reading the actual code, not hypothetical. Several of these were introduced or made worse by the recent Trafilatura migration and haven't been addressed yet.
+An honest list of where the current design is thin - found by re-reading the actual code, not hypothetical. Several of these were introduced or made worse by the Trafilatura migration; a few have since been fixed (see below), most haven't.
+
+### ✅ Recently Fixed
+
+| Weakness | Fix |
+|----------|-----|
+| **Trafilatura extraction blocked the event loop** | `build_cleaned_text()` is now `async` and calls `extract_clean_text()` via `await asyncio.to_thread(...)` (`main.py:207`, `:233`) - same pattern already used for the Groq call. Both `/explain` and `/explain-stream` now `await build_cleaned_text(request)`. |
+| **`/explain-stream` had zero rate-limit resilience** | It previously called Groq directly with no retry logic (only `/explain` had it). Both endpoints now go through `_call_groq_with_fallback()` (`main.py:332`), which reuses `_call_groq_with_retry()`'s exponential backoff. |
+| **`FALLBACK_MODEL` and `redis` were declared but unused** | `FALLBACK_MODEL` is now wired via `_call_groq_with_fallback()` (`main.py:332`): if `PRIMARY_MODEL` is still rate-limited past its retry budget or hard-errors, it falls back once to `FALLBACK_MODEL`. The unused `redis==5.0.1` dependency was removed from `requirements.txt` entirely (actually integrating a real Redis-backed cache would require provisioning external infra - an Upstash/Redis instance and `REDIS_URL` - which is a deployment decision, not a code fix, so it was deleted rather than left as dead weight). |
 
 ### Performance / Concurrency
 
 | Weakness | Detail |
 |----------|--------|
-| **Trafilatura extraction blocks the event loop** | `build_cleaned_text()` → `extract_clean_text()` → `trafilatura.extract()` is a synchronous, CPU-bound call, but it's invoked directly (`cleaned_text = build_cleaned_text(request)`) inside `async def explain(...)` / `async def explain_stream(...)` - **not** wrapped in `asyncio.to_thread` the way the actual Groq call is. Parsing a large rendered page (up to 2MB of HTML) can stall the single event loop for the whole process, delaying every other in-flight request on that worker. Fix: wrap the extraction call in `asyncio.to_thread`, same pattern already used for `client.chat.completions.create`. |
+| **No size cap on `text` when `content_type="text"`, or on `question`/`title`** | `MAX_HTML_LENGTH` (`main.py:154`) is only checked when `content_type == "html"` (`main.py:228`). Plain-text content (the default), `question`, and `title` have **no length limit at all** - not even the client's own 8,000-char `extractFallback()` cap. Combined with "CORS isn't authentication" below, this means an unbounded payload can be sent straight into a cached, billed Groq prompt. Fix: add `Field(max_length=...)` to `ExplainRequest`'s fields (`main.py:122`). |
 | **Extraction re-runs per question, not per page** | The cache key is SHA256 of the *final combined* `action:cleaned_text` (title + extracted content + question). Two different questions about the same page currently re-run Trafilatura from scratch each time, since there's no separate cache keyed on just the raw HTML/extracted content. |
 | **Bigger payload than before** | Sending full rendered `outerHTML` (up to 2,000,000 chars) is much heavier over the wire than the old client-extracted text (capped at 8,000 chars). Slower on weak connections, more data per question. |
+| **`query_normalizer`'s SymSpell dictionary load isn't offloaded** | `_get_sym_spell()` (`query_normalizer.py:150`, `lru_cache`d) does a real, if small ("tens of ms" per its own docstring), synchronous dictionary load on its first call, and `/normalize-query` (`main.py:399`, fires on every space keypress) calls into it directly inside an `async def` with no `asyncio.to_thread`. Same *class* of bug as the Trafilatura one above, just far smaller and one-time-only. |
 
 ### Security / Privacy
 
 | Weakness | Detail |
 |----------|--------|
 | **Wider data-exposure surface** | The old pipeline only ever sent *visible, Readability-extracted article text* off the browser. The new pipeline sends the **entire rendered DOM** (minus `<script>`/`<style>`/`<noscript>`) to the backend, and Trafilatura's output can include text from hidden elements, prefilled form/input values, `aria-*` attributes, and other DOM content a user never intended to share - all of which then also goes to Groq's API. This is a real regression in blast radius for sensitive pages (banking, webmail, internal tools) that hasn't been mitigated (e.g. stripping `<input>`/`<form>` values or `hidden`/`aria-hidden` subtrees before sending). |
-| **CORS is not authentication** | `ALLOWED_ORIGINS` only stops *browser-enforced* cross-origin `fetch()` calls. Anyone who knows the backend URL can call `/explain-stream` directly with `curl` or server-to-server, bypassing CORS entirely and burning Groq quota. There's no API key, token, or rate limit on the backend itself. |
+| **CORS is not authentication** | `ALLOWED_ORIGINS` only stops *browser-enforced* cross-origin `fetch()` calls. Anyone who knows the backend URL can call `/explain-stream` directly with `curl` or server-to-server, bypassing CORS entirely and burning Groq quota. There's no API key, token, or rate limit on the backend itself - see the payload-size gap above, which makes this worse than it looks. |
+| **`BACKEND.md`/`README.md` describe a different, never-shipped backend** | Both docs describe an earlier design (project named "SamajhLo", Google Gemini instead of Groq, `allow_origins=["*"]` CORS, a Redis-backed rate limiter keyed on a nonexistent `install_id` field). None of that matches the actual shipped `main.py`. Anyone onboarding from those docs instead of this one would believe rate-limiting/Redis caching already exists. |
 
 ### Reliability / Robustness
 
@@ -1320,15 +1340,20 @@ An honest list of where the current design is thin - found by re-reading the act
 |----------|--------|
 | **No fallback when Trafilatura fails** | If `trafilatura.extract()` returns empty, the request just fails with `422` for that page - there's no server-side fallback chain (e.g. try `<article>`/`<main>` selectors, or the raw text) the way the old client pipeline had four stacked fallback layers (Netflix → Readability → selectors → body text). |
 | **Netflix-style handling doesn't generalize** | Only Netflix gets a dedicated extraction path and a `MutationObserver` for dynamically-loaded content. Other heavy-SPA / infinite-scroll sites (X/Twitter, Instagram, YouTube comments, etc.) get neither - they go through generic Trafilatura, which may return sparse or unhelpful results, and the content script only captures **one DOM snapshot** at the moment the popup opens (no re-render capture for anything other than Netflix). |
-| **`FALLBACK_MODEL` and `redis` are declared but unused** | `FALLBACK_MODEL = "allam-2-7b"` is defined and mentioned in a startup log line, but no code path actually calls it - there is no real fallback if the primary Groq model errors or rate-limits past the retry budget. `redis==5.0.1` sits in `requirements.txt`, but the cache is a plain in-process Python `dict` - `redis` isn't imported anywhere. Both look like real infrastructure but aren't wired up. |
-| **In-memory-only cache** | Response cache is a plain dict inside one process: lost on every restart, and won't work correctly if the backend is ever scaled to multiple workers/processes (each would have its own separate cache). |
+| **In-memory-only cache** | Response cache is a plain dict inside one process: lost on every restart, and won't work correctly if the backend is ever scaled to multiple workers/processes (each would have its own separate cache). Only worth revisiting with a real cache backend (Redis or otherwise) if/when actually deployed with multiple workers - don't reflexively re-add the `redis` dependency just removed above. |
+| **Loading animation doesn't reset on the 2nd+ question in the same session** | `popup.ts`'s `hasStoppedLoading` flag is set `true` once `stopLoading()` runs and is **never reset to `false`** in `submit()`. Starting with the 2nd question in a session, the `RESPONSE_CHUNK` handler's `if (!hasStoppedLoading)` guard is already false, so the "Tea is boiling…" animation stays on screen for the entire streaming duration instead of clearing on the first chunk. Fix: set `hasStoppedLoading = false` at the top of `submit()`. |
+| **Unreachable dead-code path in the popup's `GET_ANSWER` callback** | `background.ts`'s `GET_ANSWER` handler kicks off `streamAnswer()` and returns `true` (promising an async `sendResponse`) but never actually calls `sendResponse()`. The corresponding callback in `popup.ts`'s `submit()` - which has its own `stopLoading()`/error-message logic - is therefore unreachable; all real answer/error handling happens through the separate `RESPONSE_CHUNK`/`RESPONSE_DONE`/`RESPONSE_ERROR` broadcasts. Harmless today, but misleading dead code that reads as load-bearing. |
 
 ### Engineering Hygiene
 
 | Weakness | Detail |
 |----------|--------|
 | **`MAX_HTML_LENGTH` is duplicated, not shared** | The same `2_000_000` limit is hand-copied into both `frontend/src/content.ts` and `backend/main.py`, kept in sync only by a code comment ("keep in sync with backend..."). Nothing enforces this at build/test time, so the two can silently drift. |
-| **Zero automated test coverage** | There is no test suite anywhere in the repo (frontend or backend). All verification so far has been manual/ad hoc (e.g. one-off `python3 -c "..."` smoke tests run during development, not committed as repeatable tests). Regressions in `build_cleaned_text()`, `extract_clean_text()`, or the SSE chunking/encoding logic would currently only be caught by hand. |
+| **Zero automated test coverage** | There is no test suite anywhere in the repo (frontend or backend). Highest-value untested code: `query_normalizer.normalize_query()` (the most algorithmically complex pure function in the repo), the `chunk_preserving_whitespace()`/`to_sse_data()` round-trip (exactly the regression class from the [FAQ-table case study](#case-study-fixing-the-broken-faq-table)), and `build_cleaned_text()`'s title/question/content combination logic. |
 | **Extraction only exercised on hand-written test HTML** | The Trafilatura migration has been verified against one synthetic HTML snippet end-to-end, not against a real spread of site types (paywalled articles, infinite-scroll feeds, login-gated pages, non-English content, heavily animated layouts). Real-world extraction quality is currently unverified beyond that. |
+| **No-op exception handling** | `_call_groq_with_retry()`'s `except APIError as e: raise e` (`main.py:329`) catches and immediately re-raises the identical exception with no added behavior (no logging, unlike the `RateLimitError` branch two lines above it). Either drop the clause or add the logging that looks like it was intended. |
+| **Unused `tabId` parameter** | `streamAnswer(..., tabId: number)` (`background.ts:18`) is plumbed all the way from `sender.tab?.id` but never referenced in the function body - `broadcastResponse()` fans out to all runtime listeners, not a specific tab. Dead parameter. |
+| **Unused frontend dependencies** | `@types/react` and `@types/react-dom` sit in `frontend/package.json` devDependencies with zero React/JSX usage anywhere in `frontend/src` (no `.tsx` files exist) - leftover from an earlier scaffold. |
+| **Verbose, unconditional debug logging** | Dozens of `console.log` calls (`content.ts`, `background.ts`, `popup.ts`) fire on every normal use, including full page-content/answer text, none gated behind a debug flag. Not a security issue by itself, but console noise and a "looks unfinished" hygiene issue for any user who opens DevTools. |
 
 None of these are blockers for personal/local use, but they're the honest gap list before wider deployment (cloud hosting, Chrome Web Store, multiple users) mentioned in [Next Steps](#next-steps).
