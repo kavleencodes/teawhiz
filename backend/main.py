@@ -329,6 +329,21 @@ async def _call_groq_with_retry(model_name: str, prompt: str, max_retries: int =
         except APIError as e:
             raise e
 
+async def _call_groq_with_fallback(prompt: str) -> str:
+    """Calls PRIMARY_MODEL (with its own rate-limit retry/backoff), and if
+    that's still rate-limited past its retry budget or hits a hard API
+    error, falls back once to FALLBACK_MODEL instead of failing outright.
+
+    FALLBACK_MODEL is a smaller/faster model, so it gets only a single
+    retry of its own - the point is resilience against the primary model
+    being briefly unavailable, not a second full retry budget.
+    """
+    try:
+        return await _call_groq_with_retry(PRIMARY_MODEL, prompt)
+    except (RateLimitError, APIError) as primary_error:
+        print(f"⚠️ Primary model '{PRIMARY_MODEL}' failed ({primary_error}); falling back to '{FALLBACK_MODEL}'")
+        return await _call_groq_with_retry(FALLBACK_MODEL, prompt, max_retries=1)
+
 async def get_groq_response(text: str, action: str = "explain") -> str:
     if not client:
         raise HTTPException(
@@ -340,8 +355,9 @@ async def get_groq_response(text: str, action: str = "explain") -> str:
     prompt = template.format(text=text)
 
     try:
-        # Call Groq API with retry logic
-        return await _call_groq_with_retry(PRIMARY_MODEL, prompt)
+        # Call Groq API with retry logic, falling back to FALLBACK_MODEL if
+        # the primary model can't serve the request.
+        return await _call_groq_with_fallback(prompt)
     except RateLimitError as e:
         print(f"⚠️ Rate limit exceeded: {e}")
         raise HTTPException(
@@ -454,11 +470,12 @@ async def explain_stream(request: ExplainRequest):
             template = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"])
             prompt = template.format(text=cleaned_text)
 
-            # Get full response from Groq, with the same rate-limit
-            # retry/backoff used by the non-streaming /explain path - without
-            # this, a transient 429 fails the whole streamed answer instead
-            # of transparently retrying.
-            full_response = await _call_groq_with_retry(PRIMARY_MODEL, prompt)
+            # Get full response from Groq, with the same retry/backoff +
+            # fallback-model behavior used by the non-streaming /explain
+            # path - without this, a transient 429 (or the primary model
+            # being unavailable) fails the whole streamed answer instead of
+            # transparently retrying/falling back.
+            full_response = await _call_groq_with_fallback(prompt)
             save_to_cache(cleaned_text, request.action, full_response)
 
             # Stream it in word chunks (like Claude)
