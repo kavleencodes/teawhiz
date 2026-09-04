@@ -23,13 +23,69 @@ function cleanText(text: string): string {
     .trim();
 }
 
+// PROBLEM: this content script runs on `"matches": ["<all_urls>"]`
+// (manifest.json) - every page the user ever asks about, including
+// banking/webmail/internal tools. getRenderedHTML() below sends the
+// *entire* rendered DOM to the backend -> Groq, not just visible article
+// text (see "Wider data-exposure surface" in CODE.md's Known Weaknesses).
+// That DOM can include password/form values, hidden/aria-hidden content,
+// and <template> markup a user never intended to share - none of which a
+// real browser ever shows them, but a raw-HTML parser (Trafilatura) or a
+// framework that live-reflects state into attributes can still see.
+// SOLUTION: strip the most obviously dangerous, invisible-to-the-user leak
+// paths client-side, before the HTML ever leaves the browser. This is not
+// a full fix (the pipeline still sends the entire *visible* DOM, and
+// CSS-class-based hiding via an external stylesheet isn't detected here) -
+// see the caveat in CODE.md - but it closes the worst, easiest-to-hit cases:
+//   - form values the user typed/selected (not just the page's original
+//     markup - some frameworks, e.g. React controlled inputs, re-render the
+//     `value`/`selected` attribute to reflect live input)
+//   - password fields, entirely
+//   - elements deliberately hidden from view (`hidden`, `aria-hidden`,
+//     inline `display:none`/`visibility:hidden` - the common way JS toggles
+//     modals/dropdowns/tooltips)
+//   - <template> markup, which is inert and never rendered in a live DOM,
+//     but survives as plain text in outerHTML - an HTML parser like
+//     Trafilatura reads it as ordinary content, unlike a real browser
+function stripSensitiveContent(clone: Document): void {
+  // Password fields: never send, regardless of value.
+  clone.querySelectorAll('input[type="password"]').forEach((el) => el.remove());
+
+  // Hidden inputs typically carry CSRF tokens / session / internal IDs -
+  // purely functional, never meant to be read, so remove outright rather
+  // than just clearing the value.
+  clone.querySelectorAll('input[type="hidden"]').forEach((el) => el.remove());
+
+  // Remaining form values: strip what the user typed or selected.
+  clone.querySelectorAll("input, textarea").forEach((el) => {
+    el.removeAttribute("value");
+    if (el.tagName === "TEXTAREA") el.textContent = "";
+  });
+  clone.querySelectorAll("option[selected]").forEach((el) => el.removeAttribute("selected"));
+
+  // Elements deliberately hidden from the user.
+  clone.querySelectorAll('[hidden], [aria-hidden="true"]').forEach((el) => el.remove());
+  clone.querySelectorAll("[style]").forEach((el) => {
+    const style = el.getAttribute("style") || "";
+    if (/display\s*:\s*none/i.test(style) || /visibility\s*:\s*hidden/i.test(style)) {
+      el.remove();
+    }
+  });
+
+  // Inert <template> content - never rendered, but a raw-HTML parser still
+  // sees the markup between the tags as plain text.
+  clone.querySelectorAll("template").forEach((el) => el.remove());
+}
+
 // Grab the current, post-render DOM as HTML for the backend to run
 // Trafilatura on. Strips script/style tags client-side purely to shrink the
-// payload - Trafilatura ignores them anyway.
+// payload - Trafilatura ignores them anyway. Also strips sensitive/hidden
+// content via stripSensitiveContent() before serializing (see above).
 function getRenderedHTML(): string {
   try {
     const clone = document.cloneNode(true) as Document;
     clone.querySelectorAll("script, style, noscript").forEach((el) => el.remove());
+    stripSensitiveContent(clone);
     return clone.documentElement.outerHTML;
   } catch (error) {
     console.error("[TeaWhiz] Failed to capture rendered HTML:", error);
