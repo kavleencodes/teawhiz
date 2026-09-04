@@ -21,9 +21,26 @@ from query_normalizer import normalize_query
 
 load_dotenv()
 
+# PROBLEM: FastAPI's default `docs_url`/`redoc_url`/`openapi_url` leave
+# Swagger UI (/docs), ReDoc (/redoc), and the raw OpenAPI schema
+# (/openapi.json) publicly browsable with zero auth. Anyone who finds the
+# backend URL could open /docs, see every endpoint's exact request/response
+# shape, and use Swagger's built-in "Try it out" button to fire real
+# requests - no need to even read this source file first.
+# SOLUTION: disabled by default (all three become 404, same as any other
+# unknown route). Set ENABLE_API_DOCS=true in backend/.env for local
+# development when you actually want to browse /docs - never enable it on
+# a publicly reachable deployment.
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").strip().lower() == "true"
+if ENABLE_API_DOCS:
+    print("⚠️ WARNING: ENABLE_API_DOCS=true - /docs, /redoc, and /openapi.json are publicly browsable. Do not enable this on a public deployment.")
+
 app = FastAPI(
     title="TeaWhiz AI",
-    version="0.1.0"
+    version="0.1.0",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
 )
 
 
