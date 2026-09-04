@@ -3,6 +3,7 @@ import re
 import json
 import hashlib
 import asyncio
+import traceback
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -119,18 +120,20 @@ def save_to_cache(text: str, action: str, answer: str):
 
 
 
-# Guard against pathological/malicious payloads (huge unbounded DOMs, or -
-# since CORS is not authentication, see Known Weaknesses in CODE.md -
-# anyone who finds this backend URL sending an oversized `text`/`question`/
-# `title` straight into a cached, billed Groq prompt). Enforced by Pydantic
-# at the request-body validation layer, so an over-limit request never even
-# reaches a route handler: FastAPI returns 422 automatically.
-#
-# MAX_HTML_LENGTH previously only guarded `content_type == "html"` payloads
-# (checked manually further down); plain `text` content, `question`, and
-# `title` had no limit at all. It's the same value used for `text` here
-# regardless of content_type, so it now also covers the html size guard
-# that used to be a separate manual check.
+# PROBLEM (fixed): `MAX_HTML_LENGTH` used to only be checked manually, and
+# only when `content_type == "html"`. Plain-text `text` (the default
+# content_type), `question`, and `title` had NO length limit at all - not
+# even the client's own 8,000-char fallback cap. Since CORS is not
+# authentication (see Known Weaknesses in CODE.md), anyone who found this
+# backend URL could send an unbounded payload straight into a cached,
+# billed Groq prompt, or just balloon server memory.
+# SOLUTION: `Field(max_length=...)` on `ExplainRequest` below enforces all
+# three limits (text/question/title) at the Pydantic request-body
+# validation layer - an over-limit request never even reaches a route
+# handler; FastAPI returns 422 automatically before any code here runs.
+# `MAX_HTML_LENGTH` is reused as `text`'s cap regardless of content_type,
+# so it now also covers what used to be a separate manual html-only check
+# (see the removed check in build_cleaned_text() below).
 MAX_HTML_LENGTH = 2_000_000
 MAX_QUESTION_LENGTH = 2_000  # a typed question is a sentence or two, not an essay
 MAX_TITLE_LENGTH = 500  # page <title> values are short; generous headroom either way
@@ -226,11 +229,17 @@ async def build_cleaned_text(request: "ExplainRequest") -> str:
     extraction comes back empty (or wasn't attempted) but a question was
     asked, the question alone is still a valid prompt.
 
-    Trafilatura's parse is synchronous/CPU-bound and can take a while on
-    large pages, so it's offloaded to a worker thread via `asyncio.to_thread`
-    - otherwise it would block the single asyncio event loop for the whole
-    process (stalling every other in-flight request, including other users'
-    SSE streams) for as long as parsing takes.
+    PROBLEM (fixed): this function used to be synchronous (`def`, not
+    `async def`) and called `extract_clean_text()` directly. Trafilatura's
+    parse is synchronous/CPU-bound, so running it inline blocked FastAPI's
+    single asyncio event loop for the *whole process* while it parsed large
+    rendered pages (up to 2MB of HTML) - stalling every other in-flight
+    request on that worker, including other users' SSE streams, for as long
+    as parsing took.
+    SOLUTION: made this function `async` and offloaded the extraction call
+    to a worker thread via `await asyncio.to_thread(...)` below - the same
+    pattern already used for the Groq API call - so the event loop stays
+    free while Trafilatura runs.
     """
     raw = request.text.strip()
 
@@ -349,6 +358,25 @@ async def _call_groq_with_fallback(prompt: str) -> str:
     FALLBACK_MODEL is a smaller/faster model, so it gets only a single
     retry of its own - the point is resilience against the primary model
     being briefly unavailable, not a second full retry budget.
+
+    PROBLEM (fixed): two separate issues used to exist here.
+      1. `/explain-stream` used to call `client.chat.completions.create`
+         directly with zero retry/backoff logic - only the non-streaming
+         `/explain` (via `get_groq_response`) had `_call_groq_with_retry`.
+         A transient 429 failed the *entire* streamed answer immediately.
+      2. `FALLBACK_MODEL = "allam-2-7b"` (near the top of this file) was
+         defined and even printed in the startup log, but no code path
+         ever actually called it - there was no real fallback if the
+         primary Groq model errored or rate-limited past its retry budget.
+    SOLUTION: this function is the single place both endpoints now go
+    through (`get_groq_response()` below, and `explain_stream()`'s
+    `stream_response()`), so both `/explain` and `/explain-stream` get the
+    same retry/backoff *and* a real fallback to `FALLBACK_MODEL`. The
+    unused `redis==5.0.1` dependency (also flagged alongside `FALLBACK_MODEL`
+    as dead infra) was removed from `requirements.txt` entirely instead of
+    wired up - actually integrating a Redis-backed cache needs external
+    infra (an Upstash/Redis instance + `REDIS_URL`), which is a deployment
+    decision, not a code fix.
     """
     try:
         return await _call_groq_with_retry(PRIMARY_MODEL, prompt)
@@ -376,15 +404,28 @@ async def get_groq_response(text: str, action: str = "explain") -> str:
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit reached. Please try again later."
         )
+    # PROBLEM (fixed): `str(e)` is an empty string for several real
+    # exception types (e.g. some httpx transport errors raised with no
+    # message). `detail=f"...: {str(e)}"` used to render as a completely
+    # blank message ("Groq API error: " / "Unexpected error: ") - both to
+    # whoever called this API, and with no traceback logged anywhere, so a
+    # real failure here was previously undiagnosable after the fact.
+    # SOLUTION: always include `type(e).__name__` and fall back to the
+    # literal string "(no message)" when `str(e)` is empty, and log a full
+    # `traceback.print_exc()` server-side (never sent to the client/caller)
+    # so a repeat occurrence is actually debuggable. See the matching fix
+    # in explain_stream()'s `except Exception` below.
     except APIError as e:
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Groq API error: {str(e)}"
+            detail=f"Groq API error: {type(e).__name__}: {str(e) or '(no message)'}"
         )
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unexpected error: {str(e)}"
+            detail=f"Unexpected error: {type(e).__name__}: {str(e) or '(no message)'}"
         )
 
 
@@ -500,9 +541,23 @@ async def explain_stream(request: ExplainRequest):
         except RateLimitError as e:
             print(f"⚠️ Rate limit exceeded: {e}")
             yield f"data: {to_sse_data('ERROR: Rate limit reached. Please try again later.')}\n\n"
+        # PROBLEM (fixed): a real incident hit this exact except block with
+        # `str(e)` empty - the server log printed literally "❌ Stream
+        # error:" with nothing after the colon, and the popup received an
+        # equally blank "ERROR: " SSE payload. No exception type, no
+        # traceback, nothing to debug from - see the matching fix in
+        # get_groq_response()'s except blocks above (same root cause: some
+        # exception types stringify to "").
+        # SOLUTION: always include `type(e).__name__` and fall back to the
+        # literal string "(no message)" when `str(e)` is empty, in both the
+        # server log line and the SSE payload sent to the client, and log a
+        # full `traceback.print_exc()` server-side (never sent to the
+        # client) so a repeat occurrence is actually debuggable.
         except Exception as e:
-            print(f"❌ Stream error: {e}")
-            yield f"data: {to_sse_data(f'ERROR: {e}')}\n\n"
+            error_detail = str(e) or "(no message)"
+            print(f"❌ Stream error: {type(e).__name__}: {error_detail}")
+            traceback.print_exc()
+            yield f"data: {to_sse_data(f'ERROR: {type(e).__name__}: {error_detail}')}\n\n"
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
 
