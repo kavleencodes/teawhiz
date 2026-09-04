@@ -2,6 +2,29 @@
 
 const BACKEND_URL = "http://localhost:8000"; // Will update in Phase 6
 
+// PROBLEM: the backend has no request auth of its own - CORS only stops
+// *browser-enforced* cross-origin fetch() calls, so anyone who finds
+// BACKEND_URL could call it directly (curl, a script, etc.) and burn the
+// Groq quota/bill. See BACKEND_API_KEY / verify_api_key() in backend/main.py.
+// SOLUTION: send this shared secret as `X-API-Key` on every backend
+// request; the backend rejects requests with a missing/wrong key (401) as
+// long as it has BACKEND_API_KEY configured on its side too.
+// Honest caveat: this value ships inside the built extension's JS - anyone
+// who unpacks the .crx/.zip can read it out. Not real secrecy against a
+// determined attacker, but it raises the bar from "just know the URL" to
+// "inspect the extension bundle first" - meaningful for a personal/local
+// project. Must exactly match BACKEND_API_KEY in backend/.env, or every
+// request will get rejected with 401 once the backend has one configured.
+const BACKEND_API_KEY = ""; // set to match backend/.env's BACKEND_API_KEY, then rebuild
+
+function backendHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (BACKEND_API_KEY) {
+    headers["X-API-Key"] = BACKEND_API_KEY;
+  }
+  return headers;
+}
+
 interface MessageRequest {
   type: string;
   content: string;
@@ -27,7 +50,7 @@ async function streamAnswer(
 
     const response = await fetch(`${BACKEND_URL}/explain-stream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: backendHeaders(),
       body: JSON.stringify({
         text: content,
         content_type: contentType,
@@ -116,7 +139,7 @@ async function streamAnswer(
 async function normalizeWord(word: string): Promise<string> {
   const response = await fetch(`${BACKEND_URL}/normalize-query`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: backendHeaders(),
     body: JSON.stringify({ text: word }),
   });
 

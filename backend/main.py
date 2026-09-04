@@ -1,13 +1,14 @@
 import os
 import re
 import json
+import time
 import hashlib
 import asyncio
 import traceback
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Header, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -48,8 +49,98 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,  # no cookies/auth are used, so this isn't needed
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-API-Key"],  # X-API-Key: see verify_api_key() below
 )
+
+
+# PROBLEM: CORS (ALLOWED_ORIGINS above) only stops *browser-enforced*
+# cross-origin fetch() calls - it does nothing to stop a direct curl/script
+# call straight to this backend's URL, bypassing CORS entirely. Combined
+# with no rate limiting, anyone who finds this backend's URL could burn
+# the Groq quota/bill with unlimited requests. See "CORS is not
+# authentication" in CODE.md's Known Weaknesses.
+# SOLUTION: a shared-secret header (BACKEND_API_KEY, checked by
+# verify_api_key() below) plus a simple in-memory per-IP rate limit
+# (rate_limiter() below), applied to every endpoint that costs Groq quota
+# or is otherwise worth protecting from unlimited hammering.
+#
+# Honest caveat: BACKEND_API_KEY is embedded in the built extension's JS
+# (frontend/src/background.ts) - anyone who unpacks the .crx/.zip can read
+# it out. This is NOT real secrecy against a determined attacker; it raises
+# the bar from "trivial to abuse" (just knowing the URL) to "have to
+# inspect the extension bundle first" - a meaningful improvement for a
+# personal/local project, not a substitute for real per-user auth if this
+# is ever opened up to multiple untrusted users.
+BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
+if not BACKEND_API_KEY:
+    print(
+        "⚠️ WARNING: BACKEND_API_KEY not set in .env - /explain, "
+        "/explain-stream, and /normalize-query are open to anyone who "
+        "knows this backend's URL (no request auth at all). Set "
+        "BACKEND_API_KEY in backend/.env AND the matching constant in "
+        "frontend/src/background.ts, then rebuild the extension, to close "
+        "this gap."
+    )
+
+
+async def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    """FastAPI dependency: rejects the request with 401 unless
+    BACKEND_API_KEY is configured and the caller supplied a matching
+    `X-API-Key` header.
+
+    Deliberately no-ops (allows the request through) if BACKEND_API_KEY
+    isn't set at all, matching this file's existing pattern for optional-but-
+    recommended config (see GROQ_API_KEY/ALLOWED_ORIGINS above) - a fresh
+    checkout without the new env var configured doesn't immediately break,
+    but see the startup warning above: this means auth is effectively
+    disabled until you set it.
+    """
+    if not BACKEND_API_KEY:
+        return
+    if x_api_key != BACKEND_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key",
+        )
+
+
+# Simple in-memory sliding-window rate limiter, keyed by (scope, client IP).
+# Deliberately dependency-free (no slowapi/redis) to match this backend's
+# existing in-memory-dict style (see response_cache above) - fine for the
+# single-process deployment this backend currently runs as.
+#
+# Known limitations (being upfront about them):
+#   - `request.client.host` is the direct TCP peer. If this is ever put
+#     behind a reverse proxy/load balancer, every caller would appear to
+#     share the proxy's IP unless `X-Forwarded-For` is parsed with a
+#     trusted-proxy allowlist (not implemented here).
+#   - Bucket entries for IPs that stop making requests are never purged, so
+#     memory grows slowly with the number of distinct IPs seen over the
+#     process's lifetime. Not a concern at personal-project scale; would
+#     need a periodic sweep before this backend serves many distinct users.
+_rate_limit_buckets: dict[str, list[float]] = {}
+
+
+def rate_limiter(scope: str, limit: int, window_seconds: int):
+    """Returns a FastAPI dependency enforcing `limit` requests per
+    `window_seconds` per client IP, independently for whichever endpoint
+    passes a given `scope` name (so /explain-stream and /normalize-query
+    don't share one budget).
+    """
+    async def _check(request: Request) -> None:
+        client_ip = request.client.host if request.client else "unknown"
+        key = f"{scope}:{client_ip}"
+        now = time.monotonic()
+        timestamps = [t for t in _rate_limit_buckets.get(key, []) if now - t < window_seconds]
+        if len(timestamps) >= limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Rate limit exceeded: max {limit} requests per {window_seconds}s. Please slow down.",
+            )
+        timestamps.append(now)
+        _rate_limit_buckets[key] = timestamps
+
+    return _check
 
 
 
@@ -450,7 +541,11 @@ async def health_check():
     }
 
 @app.post("/normalize-query", response_model=NormalizeResponse)
-async def normalize_query_endpoint(request: NormalizeRequest):
+async def normalize_query_endpoint(
+    request: NormalizeRequest,
+    _auth: None = Depends(verify_api_key),
+    _rate_limit: None = Depends(rate_limiter("normalize_query", limit=60, window_seconds=60)),
+):
     """Live, as-you-type spell correction for the popup's question input -
     called on every space-bar press, independent of QUERY_NORMALIZER_MODE
     (that flag only gates whether the *submitted* question is silently
@@ -467,7 +562,11 @@ async def normalize_query_endpoint(request: NormalizeRequest):
 
 
 @app.post("/explain", response_model=ExplainResponse)
-async def explain(request: ExplainRequest):
+async def explain(
+    request: ExplainRequest,
+    _auth: None = Depends(verify_api_key),
+    _rate_limit: None = Depends(rate_limiter("explain", limit=20, window_seconds=60)),
+):
     if request.action not in ACTION_PROMPTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -490,7 +589,11 @@ async def explain(request: ExplainRequest):
     return ExplainResponse(answer=answer, cached=False)
 
 @app.post("/explain-stream")
-async def explain_stream(request: ExplainRequest):
+async def explain_stream(
+    request: ExplainRequest,
+    _auth: None = Depends(verify_api_key),
+    _rate_limit: None = Depends(rate_limiter("explain_stream", limit=20, window_seconds=60)),
+):
     """Stream response word by word"""
     if request.action not in ACTION_PROMPTS:
         raise HTTPException(
