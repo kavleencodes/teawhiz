@@ -305,6 +305,34 @@ function getPageContent(): PageContentResult {
   return { title, contentType: "text", content: fallbackText };
 }
 
+// Capture page content on load and send to background for extraction
+async function capturePageOnLoad() {
+  try {
+    const pageContent = getPageContent();
+    console.log("[TeaWhiz] Content: Captured page on load, type:", pageContent.contentType, "length:", pageContent.content.length);
+
+    // Send to background for backend extraction
+    chrome.runtime.sendMessage(
+      {
+        type: "CAPTURE_PAGE",
+        content: pageContent.content,
+        contentType: pageContent.contentType,
+        title: pageContent.title,
+        url: window.location.href,
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.log("[TeaWhiz] Content: Background message failed:", chrome.runtime.lastError.message);
+        } else {
+          console.log("[TeaWhiz] Content: Page captured, backend response:", response?.status);
+        }
+      }
+    );
+  } catch (error) {
+    console.error("[TeaWhiz] Content: Failed to capture page on load:", error);
+  }
+}
+
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   if (request.type === "GET_PAGE_CONTENT") {
     try {
@@ -317,7 +345,13 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   }
 });
 
-// Setup Netflix monitoring immediately
+// Capture page on load (after a short delay to let the page render)
+window.addEventListener("load", () => {
+  console.log("[TeaWhiz] Content: Page loaded, scheduling capture...");
+  setTimeout(capturePageOnLoad, 1500); // Wait for page to fully render
+});
+
+// Setup Netflix monitoring
 setupNetflixMonitoring();
 
-console.log("[TeaWhiz] Content script loaded with Netflix monitoring");
+console.log("[TeaWhiz] Content script loaded with page capture on load");

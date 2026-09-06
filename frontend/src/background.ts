@@ -32,6 +32,51 @@ interface MessageRequest {
   title?: string;
   question?: string;
   word?: string;
+  url?: string;  // For CAPTURE_PAGE
+  pageContextHash?: string;  // For GET_ANSWER
+}
+
+// Storage key prefix for page context
+const PAGE_CONTEXT_STORAGE_KEY_PREFIX = "pageContext:";
+
+// Handle CAPTURE_PAGE: call backend to extract content, store in chrome.storage
+async function handleCapturePage(content: string, contentType: "html" | "text", title: string, url: string) {
+  try {
+    console.log("[TeaWhiz] Background: Capturing page for URL:", url);
+
+    const response = await fetch(`${BACKEND_URL}/extract-context`, {
+      method: "POST",
+      headers: backendHeaders(),
+      body: JSON.stringify({
+        text: content,
+        content_type: contentType,
+        title: title,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("[TeaWhiz] Background: extract-context failed:", response.status);
+      return;
+    }
+
+    const data = await response.json();
+    console.log("[TeaWhiz] Background: Extracted content, length:", data.extracted_content.length, "hash:", data.page_context_hash.substring(0, 8) + "...");
+
+    // Store in chrome.storage.local
+    const key = `${PAGE_CONTEXT_STORAGE_KEY_PREFIX}${url}`;
+    await chrome.storage.local.set({
+      [key]: {
+        content: data.extracted_content,
+        contentType: contentType,
+        title: title,
+        pageContextHash: data.page_context_hash,
+      }
+    });
+
+    console.log("[TeaWhiz] Background: Stored page context for", url);
+  } catch (error) {
+    console.error("[TeaWhiz] Background: Failed to capture page:", error);
+  }
 }
 
 // Stream answer from backend in real-time. `content` is either plain text
@@ -43,7 +88,8 @@ async function streamAnswer(
   contentType: "html" | "text",
   title: string,
   question: string,
-  tabId: number
+  tabId: number,
+  pageContextHash?: string
 ) {
   try {
     console.log("[TeaWhiz] Background: Fetching from", `${BACKEND_URL}/explain-stream`);
@@ -57,6 +103,7 @@ async function streamAnswer(
         title,
         question,
         action: "explain",
+        page_context_hash: pageContextHash || undefined,
       }),
     });
 
@@ -176,7 +223,8 @@ chrome.runtime.onMessage.addListener(
         request.contentType || "text",
         request.title || "",
         request.question || "",
-        sender.tab?.id || 0
+        sender.tab?.id || 0,
+        request.pageContextHash
       );
       return true;
     }
@@ -189,6 +237,18 @@ chrome.runtime.onMessage.addListener(
           sendResponse({ success: false, error: String(error) });
         });
       return true; // keep the message channel open for the async sendResponse
+    }
+
+    if (request.type === "CAPTURE_PAGE") {
+      console.log("[TeaWhiz] Background: Capturing page for URL:", request.url);
+      handleCapturePage(
+        request.content || "",
+        request.contentType || "text",
+        request.title || "",
+        request.url || ""
+      );
+      sendResponse({ success: true });
+      return false;
     }
   }
 );

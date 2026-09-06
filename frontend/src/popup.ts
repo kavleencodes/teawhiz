@@ -16,55 +16,62 @@ function expandResponseArea() {
   responseContainer.classList.add("active");
 }
 
-// The content script now hands over the page's own rendered DOM (or, for
-// Netflix/fallback cases, plain text) rather than pre-extracted article
-// text - extraction itself (Trafilatura, for HTML) happens on the backend.
-// So we keep content/contentType/title separate instead of one flattened
-// prompt string; they're combined server-side with the user's question.
-let pageContent = "";
-let pageContentType: "html" | "text" = "text";
-let pageTitle = "";
 const loadingWords = ["boiling", "brewing", "teaying", "sipping", "vibing"];
 let currentLoadingIndex = 0;
 let loadingInterval: any = null;
 let loadingMessageEl: HTMLElement | null = null;
 let hasStoppedLoading = false; // Track if we've already stopped loading
 
-// Get page content when popup opens
-async function loadPageContent() {
+// Storage key prefix for page context
+const PAGE_CONTEXT_STORAGE_KEY_PREFIX = "pageContext:";
+
+let currentPageContext: { content: string; contentType: "html" | "text"; title: string; pageContextHash: string } | null = null;
+let currentPageUrl = "";
+
+// Load page context from storage (populated by background on page load)
+async function loadPageContext() {
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    console.log("[TeaWhiz] Popup: Querying active tab...", tabs[0]?.id);
+    if (!tabs[0]?.id) return;
 
-    if (tabs[0]?.id) {
+    currentPageUrl = tabs[0].url || "";
+    const key = `${PAGE_CONTEXT_STORAGE_KEY_PREFIX}${currentPageUrl}`;
+    const result = await chrome.storage.local.get(key);
+
+    if (result[key]) {
+      currentPageContext = result[key] as typeof currentPageContext;
+      console.log("[TeaWhiz] Popup: Loaded page context from storage:", {
+        contentType: currentPageContext?.contentType,
+        length: currentPageContext?.content?.length,
+        hasHash: !!currentPageContext?.pageContextHash,
+      });
+      promptInput.placeholder = "Ask about this page...";
+    } else {
+      // Fallback: request from content script if not yet in storage
+      console.log("[TeaWhiz] Popup: No cached context, requesting from content script...");
       chrome.tabs.sendMessage(
         tabs[0].id,
         { type: "GET_PAGE_CONTENT" },
         (response) => {
-          console.log("[TeaWhiz] Popup: Got content response:", response);
           if (response?.success) {
-            pageContent = response.content;
-            pageContentType = response.contentType === "html" ? "html" : "text";
-            pageTitle = response.title || "";
+            currentPageContext = {
+              content: response.content,
+              contentType: response.contentType === "html" ? "html" : "text",
+              title: response.title || "",
+              pageContextHash: "",
+            };
             promptInput.placeholder = "Ask about this page...";
-            console.log(
-              "[TeaWhiz] Popup: Page content loaded, type:",
-              pageContentType,
-              "length:",
-              pageContent.length
-            );
-          } else {
-            console.log("[TeaWhiz] Popup: Content request failed", response);
+            console.log("[TeaWhiz] Popup: Page content loaded from content script");
           }
         }
       );
     }
   } catch (error) {
-    console.log("[TeaWhiz] Popup: Could not load page content:", error);
+    console.log("[TeaWhiz] Popup: Could not load page context:", error);
   }
 }
 
-loadPageContent();
+loadPageContext();
 
 // Markdown rendering function, with a hand-rolled fallback if marked throws
 function renderMarkdown(text: string): string {
@@ -244,8 +251,12 @@ function submit() {
     return;
   }
 
+  if (!currentPageContext) {
+    showMessage("Please wait - page content not yet loaded.", "error");
+    return;
+  }
+
   console.log("[TeaWhiz] Popup: Submit button clicked, clearing previous response");
-  // Clear the response content ID when submitting new question
   const oldResponse = document.getElementById("responseContent");
   if (oldResponse) {
     oldResponse.parentElement?.remove();
@@ -253,8 +264,6 @@ function submit() {
 
   showMessage(userQuestion, "user");
 
-  // Clear the input now that the question has been posted as a message,
-  // so the user isn't left staring at their already-asked question.
   promptInput.value = "";
   promptInput.style.height = "auto";
   chrome.storage.local.set({ savedPrompt: "" });
@@ -263,26 +272,24 @@ function submit() {
   submitBtn.disabled = true;
   submitBtn.textContent = "...";
 
-  // Show loading animation
   showLoading();
 
   console.log("[TeaWhiz] Popup: Sending GET_ANSWER to background", {
-    hasPageContent: !!pageContent,
-    pageContentType,
-    pageContentLength: pageContent.length,
+    hasPageContext: !!currentPageContext,
+    contentType: currentPageContext.contentType,
+    contentLength: currentPageContext.content.length,
     userQuestion: userQuestion,
+    pageContextHash: currentPageContext.pageContextHash,
   });
 
-  // Page content and the question travel separately - the backend combines
-  // them (after running Trafilatura extraction, if contentType is "html")
-  // rather than the popup gluing raw HTML and a question into one string.
   chrome.runtime.sendMessage(
     {
       type: "GET_ANSWER",
-      content: pageContent,
-      contentType: pageContentType,
-      title: pageTitle,
+      content: currentPageContext.content,
+      contentType: currentPageContext.contentType,
+      title: currentPageContext.title,
       question: userQuestion,
+      pageContextHash: currentPageContext.pageContextHash,
     },
     (response) => {
       console.log("[TeaWhiz] Popup: Got callback response:", response);

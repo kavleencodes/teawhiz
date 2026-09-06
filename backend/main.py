@@ -681,6 +681,37 @@ async def explain_stream(
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
 
+
+class ExtractContextRequest(BaseModel):
+    text: str = Field(..., max_length=MAX_HTML_LENGTH)
+    content_type: str = "text"
+    title: Optional[str] = Field(default=None, max_length=MAX_TITLE_LENGTH)
+
+class ExtractContextResponse(BaseModel):
+    extracted_content: str
+    page_context_hash: str
+
+@app.post("/extract-context", response_model=ExtractContextResponse)
+async def extract_context(
+    request: ExtractContextRequest,
+    _auth: None = Depends(verify_api_key),
+    _rate_limit: None = Depends(rate_limiter("extract_context", limit=30, window_seconds=60)),
+):
+    """Extracts and cleans page content via Trafilatura without a question.
+    Called by the content script on page load so the popup never triggers extraction."""
+    raw = request.text.strip()
+
+    if request.content_type == "html":
+        if not raw:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
+        content = await get_or_extract_page_context(raw, url_hint=request.title)
+        page_context_hash = get_page_context_cache_key(content, request.title or "")
+    else:
+        content = raw
+        page_context_hash = hashlib.sha256(f"{request.title or ''}:{raw}".encode()).hexdigest()
+
+    return ExtractContextResponse(extracted_content=content, page_context_hash=page_context_hash)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
