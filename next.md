@@ -1137,5 +1137,67 @@ curl -X POST http://localhost:8000/explain-stream \
 
 ---
 
-**Last Updated:** September 4, 2026
-**Status:** Plan complete. Ready to begin Phase 1 implementation.
+---
+
+## What Has Been Implemented & Committed 
+
+### Commit: `2b2e1be` — "changing the arch to extract the DOM once and storing once only"
+
+**Goal:** Capture page content once when a page opens (via `CAPTURE_PAGE` message from content script → `/extract-context` backend endpoint), store in `chrome.storage.local`, and reuse for multiple questions in the popup — avoiding re-capture on each popup open.
+
+#### Backend (`backend/main.py`)
+
+- Added `ExtractContextRequest` and `ExtractContextResponse` Pydantic models
+- Added `POST /extract-context` endpoint that:
+  - Accepts raw HTML/text content + title
+  - Runs Trafilatura extraction (for HTML) or returns raw text (for text)
+  - Returns `extracted_content` + `page_context_hash` (SHA256 of content)
+  - Protected by `verify_api_key` and rate-limited (30 req / 60s)
+- Added `_page_context_cache` in-memory dict (max 1000 entries, 7-day TTL)
+- Added `get_page_context_cache_key()` — SHA256 of `url_hint:cleaned_text`
+- Added `get_or_extract_page_context()` — extracts once, caches by hash, returns cached content on hit
+- Updated `build_cleaned_text()` to use `get_or_extract_page_context()` for HTML content
+
+#### Content Script (`frontend/src/content.ts`)
+
+- Added `capturePageOnLoad()` function:
+  - Calls `getPageContent()` to grab rendered DOM or fallback text
+  - Sends `CAPTURE_PAGE` message to background with content, contentType, title, and URL
+- Registered `window.load` event listener with 1.5s `setTimeout` delay to let page render fully
+- Logs capture status to console
+
+#### Background (`frontend/src/background.ts`)
+
+- Added `pageContextHash?: string` to `MessageRequest` interface
+- Added `handleCapturePage()` function:
+  - Calls `POST /extract-context` with content, contentType, title
+  - Stores result in `chrome.storage.local` under key `pageContext:<url>` with fields: `content`, `contentType`, `title`, `pageContextHash`
+- Added `CAPTURE_PAGE` message handler in `onMessage` listener
+- Updated `streamAnswer()` to accept optional `pageContextHash` parameter and forward `page_context_hash` in the request body
+
+#### Popup (`frontend/src/popup.ts`)
+
+- Replaced `pageContent`/`pageContentType`/`pageTitle` variables with single `currentPageContext` object
+- Added `loadPageContext()` function:
+  - Reads from `chrome.storage.local` using key `pageContext:<url>`
+  - Falls back to `GET_PAGE_CONTENT` message to content script if not yet cached
+- Updated `submit()` to:
+  - Check `currentPageContext` is loaded before submitting
+  - Send `pageContextHash` alongside content in `GET_ANSWER` message
+- Removed unused variables (pageContent, pageContentType, pageTitle)
+
+#### TypeScript Fixes
+
+- Added `pageContextHash?: string` to `MessageRequest` interface and `streamAnswer()` signature
+- Removed unused `pageContent`, `pageContentType`, `pageTitle` declarations
+- Added type assertion `as typeof currentPageContext` and optional chaining for nullable `currentPageContext`
+
+#### Backend Verification
+
+- Confirmed `trafilatura 2.2.0` installed in venv
+- Verified `python -c "import main"` succeeds
+
+---
+
+**Last Updated:** September 6, 2026
+**Status:** Phase 2 (page context caching) implemented and committed. Ready to begin Phase 1 (conversation state).
