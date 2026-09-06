@@ -1139,9 +1139,7 @@ curl -X POST http://localhost:8000/explain-stream \
 
 ---
 
-## What Has Been Implemented & Committed 
-
-### Commit: `2b2e1be` — "changing the arch to extract the DOM once and storing once only"
+ "changing the arch to extract the DOM once and storing once only"
 
 **Goal:** Capture page content once when a page opens (via `CAPTURE_PAGE` message from content script → `/extract-context` backend endpoint), store in `chrome.storage.local`, and reuse for multiple questions in the popup — avoiding re-capture on each popup open.
 
