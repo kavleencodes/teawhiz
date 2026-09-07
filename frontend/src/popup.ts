@@ -87,6 +87,84 @@ const submitBtn = document.getElementById("submit") as HTMLButtonElement;
 const clearBtn = document.getElementById("clearBtn") as HTMLButtonElement;
 const messagesContainer = document.getElementById("messagesContainer") as HTMLDivElement;
 const responseContainer = document.getElementById("responseContainer") as HTMLDivElement;
+const convIdEl = document.getElementById("convId") as HTMLDivElement;
+const convIdValueEl = document.getElementById("convIdValue") as HTMLSpanElement;
+
+// Reflect the current conversation's ID in the corner badge. Shows the
+// first 8 chars of the UUID (enough to tell conversations apart at a
+// glance, without making the badge noisy) and exposes the full ID via
+// the title attribute / click-to-copy handler below.
+function updateConvIdBadge() {
+  if (!conversationState || !convIdValueEl) return;
+  const id = conversationState.conversationId;
+  convIdValueEl.textContent = id.slice(0, 8);
+  convIdEl.title = `Conversation ID: ${id}\nClick to copy`;
+}
+
+// Beautiful dark session-start banner shown only above the first user
+// message of a brand-new conversation. The full UUID is on display (and
+// selectable in one click) so the user has a clear "this is the session"
+// anchor at the top of the thread.
+function renderConvStartBanner() {
+  if (!conversationState) return;
+  const banner = document.createElement("div");
+  banner.className = "conv-start";
+
+  const label = document.createElement("div");
+  label.className = "conv-start-label";
+  label.textContent = "New conversation";
+
+  const id = document.createElement("div");
+  id.className = "conv-start-id";
+  id.textContent = conversationState.conversationId;
+
+  const hint = document.createElement("div");
+  hint.className = "conv-start-hint";
+  hint.textContent = "Click to copy \u2022 this id stays the same for every follow-up on this page";
+
+  banner.appendChild(label);
+  banner.appendChild(id);
+  banner.appendChild(hint);
+
+  banner.addEventListener("click", () => {
+    if (!conversationState) return;
+    void navigator.clipboard.writeText(conversationState.conversationId).catch(() => {
+      /* clipboard unavailable - user can still select manually via user-select:all */
+    });
+    const original = hint.textContent;
+    hint.textContent = "Copied!";
+    setTimeout(() => { hint.textContent = original; }, 1200);
+  });
+
+  messagesContainer.appendChild(banner);
+}
+
+// Click badge to copy the full conversation UUID to the clipboard.
+// Brief "Copied!" affordance via a class swap, then reverts after 1s.
+convIdEl.addEventListener("click", async () => {
+  if (!conversationState) return;
+  try {
+    await navigator.clipboard.writeText(conversationState.conversationId);
+  } catch {
+    // Fallback for environments without the async clipboard API.
+    const ta = document.createElement("textarea");
+    ta.value = conversationState.conversationId;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch { /* ignore */ }
+    document.body.removeChild(ta);
+  }
+  const original = convIdValueEl.textContent;
+  convIdEl.classList.add("copied");
+  convIdValueEl.textContent = "Copied!";
+  setTimeout(() => {
+    convIdEl.classList.remove("copied");
+    if (conversationState) convIdValueEl.textContent = conversationState.conversationId.slice(0, 8);
+    else convIdValueEl.textContent = original;
+  }, 1000);
+});
 
 // Reveal the response area (it starts hidden so only the search bar shows)
 // and let the popup expand underneath the search bar.
@@ -184,6 +262,7 @@ async function initializeConversation() {
     }
   }
 
+  updateConvIdBadge();
   await persistConversation();
 }
 
@@ -304,6 +383,7 @@ clearBtn.addEventListener("click", async () => {
       currentPageContext.content,
       currentPageContext.title,
     );
+    updateConvIdBadge();
     await persistConversation();
   }
   promptInput.focus();
@@ -453,6 +533,15 @@ function submit() {
 }
 
 function showMessage(text: string, type: "user" | "assistant" | "error", persist: boolean = true) {
+  // If this is the very first user turn of a brand-new conversation, drop a
+  // dark "session start" banner above the message. The banner lives only in
+  // the DOM (not in conversationState.messages), so reopening the popup
+  // won't re-show it - we only render when the container is currently empty
+  // AND it's a user message (loading/assistant/error shouldn't trigger it).
+  if (type === "user" && messagesContainer.children.length === 0) {
+    renderConvStartBanner();
+  }
+
   const messageEl = document.createElement("div");
   messageEl.className = `message ${type}`;
 

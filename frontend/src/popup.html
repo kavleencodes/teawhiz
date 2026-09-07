@@ -494,9 +494,114 @@
             color: var(--primary);
             font-weight: 700;
         }
+
+        /* Conversation ID badge - sits in the top-right of the popup,
+           visually subtle so it doesn't compete with the input area.
+           Click to copy the full UUID; the label itself only shows the
+           first 8 chars (enough to identify a conversation at a glance). */
+        .conv-id {
+            position: absolute;
+            top: 8px;
+            right: 12px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-family: "Fira Code", "Monaco", "Courier New", monospace;
+            font-size: 10px;
+            color: var(--text-light);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 2px 8px;
+            cursor: pointer;
+            user-select: none;
+            opacity: 0.7;
+            transition: opacity 0.15s, border-color 0.15s, color 0.15s;
+        }
+
+        .conv-id:hover {
+            opacity: 1;
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+
+        .conv-id.copied {
+            border-color: var(--primary);
+            color: var(--primary);
+            opacity: 1;
+        }
+
+        .conv-id-label {
+            font-weight: 600;
+            letter-spacing: 0.3px;
+        }
+
+        .conv-id-value {
+            letter-spacing: 0.2px;
+        }
+
+        /* "Start of conversation" banner - shown only on the first turn of a
+           fresh conversation. Dark, full-width, sits above the first user
+           message so the conversation id is unmissable when the user kicks
+           things off. Once any message exists we never re-render it. */
+        .conv-start {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+            margin-bottom: 12px;
+            padding: 14px 16px;
+            background: linear-gradient(135deg, #1a1a1a 0%, #2a1f1a 100%);
+            color: #f5e9d8;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            animation: slideIn 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* Subtle orange glow on the left edge - brand accent on dark. */
+        .conv-start::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 3px;
+            background: linear-gradient(to bottom, var(--accent), var(--primary));
+        }
+
+        .conv-start-label {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            color: var(--accent);
+            opacity: 0.85;
+        }
+
+        .conv-start-id {
+            font-family: "Fira Code", "Monaco", "Courier New", monospace;
+            font-size: 13px;
+            color: #f5e9d8;
+            word-break: break-all;
+            line-height: 1.4;
+            user-select: all;
+        }
+
+        .conv-start-hint {
+            font-size: 11px;
+            color: rgba(245, 233, 216, 0.55);
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
+    <div class="conv-id" id="convId" title="Click to copy full conversation ID">
+        <span class="conv-id-label">id:</span>
+        <span class="conv-id-value" id="convIdValue">—</span>
+    </div>
     <div class="container">
         <!-- Input Area (top) -->
         <div class="input-area">
