@@ -74,12 +74,39 @@ async function persistConversation() {
   await chrome.storage.local.set({ [CONVERSATION_KEY]: payload });
 }
 
+// Hard cap on the page content we hand the LLM, in characters.
+// Why: Groq's free tier caps gpt-oss-120b at 8K tokens-per-minute per
+// request. 4 chars ≈ 1 token, so 6000 chars ≈ 1500 tokens of page content
+// leaves ~6500 tokens for the question + history + action template + the
+// model's 1024-token output - safely under the 8K TPM ceiling even on the
+// first turn (no history yet). When the original content is well over the
+// cap, we keep both the head (where the page title + intro usually live)
+// and the tail (where the conclusion usually lives) and drop the middle -
+// this is what lets YouTube watch pages keep the video title + description
+// (top) and "Up next" / footer (bottom) while dropping the long middle of
+// the recommended-videos sidebar.
+const MAX_SYSTEM_CONTEXT_CHARS = 6000;
+const HEAD_KEEP_CHARS = 3000;
+const TAIL_KEEP_CHARS = 2800;
+
 function buildSystemContext(): string {
   if (!conversationState) return "";
   const title = conversationState.pageTitle || "Untitled";
   const content = conversationState.pageContext || "";
   if (!content) return `Page Title: ${title}`;
-  return `Page Title: ${title}\n\nPage Content:\n${content}`;
+
+  const head = `Page Title: ${title}\n\nPage Content:\n`;
+  const budget = MAX_SYSTEM_CONTEXT_CHARS - head.length;
+  let trimmed = content;
+  if (content.length > budget) {
+    // Keep both the head (article title + intro / YouTube video title +
+    // description) and the tail (conclusion / footer), drop the middle
+    // (long sidebars of recommended content, etc).
+    const headPart = content.slice(0, HEAD_KEEP_CHARS);
+    const tailPart = content.slice(-TAIL_KEEP_CHARS);
+    trimmed = headPart + "\n\n[... middle of page omitted ...]\n\n" + tailPart;
+  }
+  return head + trimmed;
 }
 
 const promptInput = document.getElementById("prompt") as HTMLTextAreaElement;
@@ -264,6 +291,20 @@ async function initializeConversation() {
 
   updateConvIdBadge();
   await persistConversation();
+}
+
+// Defensive reset: if the previous submission's RESPONSE_DONE / RESPONSE_ERROR
+// broadcast was missed (popup was closed mid-stream, or the page was reopened
+// after a server-side failure), the submit button could be left disabled.
+// Force it back to its idle state every time the popup opens, and clear any
+// stale loading bubble that might still be in the DOM from a prior session.
+function resetPopupToIdle() {
+  submitBtn.disabled = false;
+  submitBtn.textContent = "⬆";
+  if (loadingMessageEl) {
+    stopLoading();
+  }
+  hasStoppedLoading = false;
 }
 
 loadPageContext();
@@ -716,4 +757,11 @@ chrome.runtime.onMessage.addListener((request) => {
 });
 
 promptInput.focus();
+
+// Reset the submit button to its idle state - safe to call here because
+// `submitBtn`, `loadingMessageEl`, `hasStoppedLoading`, and `stopLoading`
+// are all initialized above this point. See resetPopupToIdle()'s comment
+// for why this is defensive cleanup rather than dead code.
+resetPopupToIdle();
+
 console.log("TeaWhiz AI popup loaded");

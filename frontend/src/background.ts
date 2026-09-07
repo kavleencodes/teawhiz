@@ -123,10 +123,25 @@ async function streamAnswer(
     console.log("[TeaWhiz] Background: Got response status:", response.status);
 
     if (!response.ok) {
-      console.error("[TeaWhiz] Background: Backend error", response.status);
+      // Read the error body so the user sees *why* the request failed,
+      // not just a status code. Backend's 400/413 responses include a
+      // JSON `detail` field (e.g. "Please reduce the length of the
+      // messages or completion.") that's the only actionable signal -
+      // surfacing it lets the user know when their page is too long vs
+      // when the backend is actually down.
+      let errorDetail = `Backend error: ${response.status}`;
+      try {
+        const errorBody = await response.json();
+        if (errorBody?.detail) {
+          errorDetail = `${response.status}: ${errorBody.detail}`;
+        }
+      } catch {
+        // Body wasn't JSON - fall back to status code only
+      }
+      console.error("[TeaWhiz] Background: Backend error", errorDetail);
       broadcastResponse({
         type: "RESPONSE_ERROR",
-        error: `Backend error: ${response.status}`,
+        error: errorDetail,
       });
       return;
     }

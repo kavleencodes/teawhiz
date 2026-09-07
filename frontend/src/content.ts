@@ -236,6 +236,33 @@ function setupNetflixMonitoring() {
 
 function extractFallback(): string {
   try {
+    // YouTube-specific: extract video titles from ytd- elements
+    const isYouTube = window.location.hostname.includes("youtube.com");
+    if (isYouTube) {
+      const titles: string[] = [];
+      const videoElements = document.querySelectorAll(
+        'ytd-video-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer'
+      );
+      for (const el of videoElements) {
+        // Look for video title elements (they contain the text we want)
+        const titleEl = el.querySelector('a#video-title-link, span[title]');
+        if (titleEl) {
+          const title = titleEl.textContent || titleEl.getAttribute("title") || "";
+          if (title.length > 2 && !titles.includes(title)) {
+            titles.push(title);
+          }
+        }
+      }
+      if (titles.length > 3) {
+        const listContent = titles
+          .slice(0, 50)
+          .map((title) => `- ${title.trim()}`)
+          .join("\n");
+        console.log(`[TeaWhiz] Extracted ${titles.length} YouTube video titles`);
+        return `YouTube Videos:\n\n${listContent}`;
+      }
+    }
+
     const contentSelectors = [
       "article",
       "main",
@@ -294,10 +321,12 @@ function getPageContent(): PageContentResult {
     return { title, contentType: "html", content: html };
   }
 
-  if (html.length > MAX_HTML_LENGTH) {
+  if (html && html.length > MAX_HTML_LENGTH) {
     console.log(
       `[TeaWhiz] Rendered HTML too large (${html.length} chars), falling back to DOM text extraction`
     );
+  } else if (!html) {
+    console.log("[TeaWhiz] Rendered HTML capture returned empty, falling back to DOM text extraction");
   }
 
   // Last resort: plain DOM text (huge pages, or HTML capture failed)
@@ -334,6 +363,76 @@ async function capturePageOnLoad() {
   }
 }
 
+// Heuristic: does the current page have "real" content yet, or is it still
+// the pre-hydration skeleton? YouTube's Polymer web components render
+// their actual content (video titles, descriptions, channel names) into
+// the DOM only after JS runs - the initial HTML is just <ytd-app>... with
+// empty <ytd-rich-grid-renderer> etc. We consider a page "hydrated" when
+// it has enough visible text to be useful for an LLM. This is a rough
+// signal (counts text in main + body) but it's good enough to skip the
+// pre-hydration snapshot without having to know about every site's
+// custom-element internals.
+//
+// Site-specific overrides: YouTube's pre-hydration header + sidebar text
+// already exceeds 500 chars, so the generic threshold would fire on the
+// skeleton. For YouTube, we require *actual video links* (the thing the
+// user is asking about) before declaring the page hydrated. Other
+// Polymer-heavy sites get a much higher generic threshold.
+function pageHasMeaningfulContent(): boolean {
+  const isYouTube = window.location.hostname.includes("youtube.com");
+
+  if (isYouTube) {
+    // The thing we want the LLM to see is the list of videos. YouTube uses
+    // custom elements (ytd-video-renderer, ytd-rich-item-renderer) to wrap
+    // videos, so check for those. Also look for title elements inside them
+    // (which contain the video name the LLM needs to see).
+    const videoElements = document.querySelectorAll(
+      'ytd-video-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer'
+    );
+    if (videoElements.length >= 3) {
+      // Also verify at least one has a title (not just empty containers)
+      for (const el of videoElements) {
+        const titleEl = el.querySelector('a#video-title-link, [id*="video-title"], h3 a, span[title]');
+        if (titleEl) return true;
+      }
+    }
+
+    // Fallback: look for watch links as before
+    const watchLinks = document.querySelectorAll('a[href*="/watch?v="], a[href*="/shorts/"]');
+    if (watchLinks.length >= 3) return true;
+    // On a single watch page there may be 0-2 links (related sidebar
+    // hasn't loaded yet). Fall back to: did the title and channel render?
+    // <h1> with non-trivial text + an #owner / ytd-video-owner-renderer
+    // are the canonical "watch page is ready" signals.
+    const h1 = document.querySelector("h1");
+    const owner = document.querySelector("ytd-video-owner-renderer, #owner");
+    if (h1 && h1.textContent && h1.textContent.trim().length > 5 && owner) {
+      return true;
+    }
+    return false;
+  }
+
+  // Generic site: 5000 chars of visible text in main/article/body.
+  // Lower thresholds (e.g. 500) trip on nav/header chrome alone, which
+  // for some sites is fully pre-hydration content. 5K is enough to know
+  // the page has its main body rendered without being so high it
+  // excludes short articles.
+  const containers = [
+    document.querySelector("main"),
+    document.querySelector("article"),
+    document.body,
+  ].filter((el): el is HTMLElement => !!el);
+
+  let total = 0;
+  for (const el of containers) {
+    // textContent on the element includes its descendants - exactly what
+    // we want. innerText would force layout, which is expensive.
+    total += (el.textContent || "").length;
+    if (total > 5000) return true;
+  }
+  return false;
+}
+
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   if (request.type === "GET_PAGE_CONTENT") {
     try {
@@ -362,9 +461,81 @@ function scheduleCapture(delayMs: number, force: boolean) {
 }
 
 window.addEventListener("load", () => {
-  console.log("[TeaWhiz] Content: Page loaded, scheduling capture...");
-  scheduleCapture(1500, false); // initial render delay
+  const isYouTube = window.location.hostname.includes("youtube.com");
+
+  // YouTube's 1.5s snapshot almost always catches the pre-hydration
+  // skeleton (no video links in the DOM yet), so on YouTube we *skip*
+  // the initial capture entirely and rely on the hydration-aware
+  // observer below. Other sites keep the standard 1.5s initial
+  // capture for snappier first-question latency.
+  if (!isYouTube) {
+    console.log("[TeaWhiz] Content: Page loaded, scheduling capture...");
+    scheduleCapture(1500, false);
+  } else {
+    console.log("[TeaWhiz] Content: YouTube detected, skipping initial 1.5s capture (skeleton-prone), using hydration observer");
+  }
+
+  // Slow-hydrating pages (YouTube home/watch, Polymer/SPA apps):
+  // wait for actual rendered content, capped at 8s, with a
+  // MutationObserver as a "content appeared" trigger. Replaces a fixed
+  // 3.5s delay that was both too late for some pages and too early
+  // for others.
+  if (isYouTube) {
+    scheduleHydrationAwareCapture(8000);
+  }
 });
+
+// Watch the DOM for content arriving after the initial 1.5s snapshot, then
+// re-capture as soon as the page actually has visible text. Caps at
+// `timeoutMs` so a page that never hydrates doesn't keep the observer
+// alive forever.
+let hydrationObserver: MutationObserver | null = null;
+let hydrationTimeoutId: ReturnType<typeof setTimeout> | null = null;
+let hydrationCaptureDone = false;
+
+function scheduleHydrationAwareCapture(timeoutMs: number) {
+  if (hydrationCaptureDone) return;
+
+  // If content is already there by the time we run, capture immediately.
+  if (pageHasMeaningfulContent()) {
+    hydrationCaptureDone = true;
+    void capturePageOnLoad();
+    return;
+  }
+
+  // Otherwise, watch for DOM mutations and re-check the heuristic.
+  hydrationObserver = new MutationObserver(() => {
+    if (hydrationCaptureDone) return;
+    if (pageHasMeaningfulContent()) {
+      hydrationCaptureDone = true;
+      if (hydrationObserver) {
+        hydrationObserver.disconnect();
+        hydrationObserver = null;
+      }
+      if (hydrationTimeoutId) {
+        clearTimeout(hydrationTimeoutId);
+        hydrationTimeoutId = null;
+      }
+      void capturePageOnLoad();
+    }
+  });
+
+  hydrationObserver.observe(document.body, { childList: true, subtree: true });
+
+  // Hard timeout - if the page never hydrates within `timeoutMs`, capture
+  // whatever we have (the pre-hydration skeleton) so the user at least
+  // gets *something* rather than a permanently-stale storage entry.
+  hydrationTimeoutId = setTimeout(() => {
+    if (hydrationCaptureDone) return;
+    hydrationCaptureDone = true;
+    if (hydrationObserver) {
+      hydrationObserver.disconnect();
+      hydrationObserver = null;
+    }
+    console.log(`[TeaWhiz] Content: Hydration timeout (${timeoutMs}ms) reached, capturing current state`);
+    void capturePageOnLoad();
+  }, timeoutMs);
+}
 
 window.addEventListener("pageshow", (event) => {
   if (event.persisted) {
@@ -374,6 +545,38 @@ window.addEventListener("pageshow", (event) => {
     scheduleCapture(500, true);
   }
 });
+
+// YouTube SPA navigation: when the user clicks from the home grid to a
+// watch page (or back), the content script survives but the page content
+// has changed. Hook pushState/replaceState/popstate to re-arm the
+// hydration observer so the new page's content gets captured too.
+if (window.location.hostname.includes("youtube.com")) {
+  const rearmOnYouTubeNav = () => {
+    hydrationCaptureDone = false;
+    if (hydrationObserver) {
+      hydrationObserver.disconnect();
+      hydrationObserver = null;
+    }
+    if (hydrationTimeoutId) {
+      clearTimeout(hydrationTimeoutId);
+      hydrationTimeoutId = null;
+    }
+    scheduleHydrationAwareCapture(8000);
+  };
+  const origPushState = history.pushState.bind(history);
+  const origReplaceState = history.replaceState.bind(history);
+  history.pushState = (...args) => {
+    const result = origPushState(...args);
+    rearmOnYouTubeNav();
+    return result;
+  };
+  history.replaceState = (...args) => {
+    const result = origReplaceState(...args);
+    rearmOnYouTubeNav();
+    return result;
+  };
+  window.addEventListener("popstate", rearmOnYouTubeNav);
+}
 
 // Setup Netflix monitoring
 setupNetflixMonitoring();

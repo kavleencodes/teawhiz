@@ -452,18 +452,25 @@ async def build_cleaned_text(request: "ExplainRequest") -> str:
 
 
 
-# Maximum content length to send to the LLM. Groq's token limits vary by
-# model, but gpt-oss-120b has ~120k tokens context. Assuming 1 token ≈ 4
-# chars, 100k chars ≈ 25k tokens, leaving ~90k for system prompt + reasoning.
-# This is a safety net to prevent "messages too long" errors without having
-# to recompute token counts.
-MAX_LLM_CONTENT_LENGTH = 100_000
+# Maximum content length to send to the LLM. The hard cap is the Groq
+# free tier's per-request token rate-limit, not the model's nominal
+# context window:
+#   - gpt-oss-120b on the free tier: 8K tokens-per-minute per request
+#   - 4 chars ≈ 1 token, so 8000 chars ≈ 2000 tokens of input
+#   - we need headroom for the 1024-token output + history + framing
+# We picked 8000 chars (≈2K tokens of content) to stay safely under that
+# cap even with a few turns of conversation history attached. The
+# frontend (popup.ts's buildSystemContext) also caps its systemContext
+# payload at 6000 chars so the first turn is well under the limit, and
+# this server-side cap is the safety net for cases where the frontend's
+# own cap is bypassed (e.g. older extension builds, raw curl tests).
+MAX_LLM_CONTENT_LENGTH = 8_000
 
 def truncate_for_llm(text: str) -> str:
     """Truncates oversized content before sending to the LLM, prioritizing
     the *end* of the content (where the user's question typically is) over
-    earlier context. If truncation occurs, appends a marker so the LLM knows
-    some content was dropped."""
+    earlier context. If truncation occurs, prepends a marker so the LLM
+    knows some content was dropped."""
     if len(text) <= MAX_LLM_CONTENT_LENGTH:
         return text
 
@@ -473,7 +480,7 @@ def truncate_for_llm(text: str) -> str:
         f"[LLM] Truncated prompt: {len(text)} chars -> {len(kept)} chars "
         f"({100 * len(kept) / len(text):.0f}% kept, start discarded)"
     )
-    return f"[... content truncated ...]\n\n{kept}"
+    return f"[... earlier content omitted ...]\n\n{kept}"
 
 
 def build_conversation_prompt(system_context: str, history: list[dict], question: str, base_template: str) -> str:
@@ -568,13 +575,17 @@ async def _call_groq_with_retry(model_name: str, prompt: str, max_retries: int =
     """Invokes Groq API with exponential backoff on rate limit errors."""
     for attempt in range(max_retries + 1):
         try:
-        
+
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=2048
+                # 1024 (was 2048): gpt-oss-120b's effective output ceiling on
+                # Groq is sometimes lower than the model's nominal 128k context
+                # window suggests - 2048 was triggering 400 "reduce the length
+                # of the messages or completion" on long page-context prompts.
+                max_tokens=1024
             )
             if not response.choices or not response.choices[0].message.content:
                 raise HTTPException(
