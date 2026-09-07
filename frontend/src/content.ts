@@ -240,27 +240,58 @@ function extractFallback(): string {
     const isYouTube = window.location.hostname.includes("youtube.com");
     if (isYouTube) {
       const titles: string[] = [];
-      const videoElements = document.querySelectorAll(
-        'ytd-video-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer'
-      );
-      for (const el of videoElements) {
-        // Look for video title elements (they contain the text we want)
-        const titleEl = el.querySelector('a#video-title-link, span[title]');
-        if (titleEl) {
-          const title = titleEl.textContent || titleEl.getAttribute("title") || "";
-          if (title.length > 2 && !titles.includes(title)) {
-            titles.push(title);
+
+      // Try multiple selectors to find videos (YouTube structure varies)
+      const videoSelectors = [
+        'ytd-video-renderer',
+        'ytd-rich-item-renderer',
+        'ytd-grid-video-renderer',
+        '[data-video-id]', // Direct video ID marker
+        'a[href*="/watch?v="]', // Video links
+      ];
+
+      for (const selector of videoSelectors) {
+        const videoElements = document.querySelectorAll(selector);
+        console.log(`[TeaWhiz YouTube] Trying selector "${selector}": found ${videoElements.length} elements`);
+
+        for (const el of videoElements) {
+          // Look for title in various places
+          let title = "";
+
+          // Try multiple title selectors
+          const titleEl = el.querySelector(
+            'a#video-title-link, a[title], span[title], h3 a, h3, .title'
+          );
+
+          if (titleEl) {
+            title = titleEl.textContent || titleEl.getAttribute("title") || "";
+          } else if (el.textContent) {
+            // Fallback: first 100 chars of element text (might be noisy)
+            title = el.textContent.substring(0, 100);
+          }
+
+          const cleanTitle = title.trim().substring(0, 150); // Cap at 150 chars
+          if (cleanTitle.length > 2 && !titles.includes(cleanTitle)) {
+            titles.push(cleanTitle);
           }
         }
+
+        if (titles.length >= 3) {
+          console.log(`[TeaWhiz YouTube] Found ${titles.length} titles using selector "${selector}"`);
+          break; // Stop trying other selectors once we have videos
+        }
       }
-      if (titles.length > 3) {
+
+      if (titles.length >= 3) {
         const listContent = titles
           .slice(0, 50)
-          .map((title) => `- ${title.trim()}`)
+          .map((title) => `- ${title}`)
           .join("\n");
         console.log(`[TeaWhiz] Extracted ${titles.length} YouTube video titles`);
-        return `YouTube Videos:\n\n${listContent}`;
+        return `## YouTube Videos\n\n${listContent}`;
       }
+
+      console.log("[TeaWhiz YouTube] No videos found after trying all selectors");
     }
 
     const contentSelectors = [
