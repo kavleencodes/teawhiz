@@ -305,29 +305,30 @@ function getPageContent(): PageContentResult {
   return { title, contentType: "text", content: fallbackText };
 }
 
-// Capture page content on load and send to background for extraction
+// Capture page content on load and send to background for extraction.
+// Fire-and-forget: background does the async fetch + storage write, no
+// response is required. Using a callback here only produced a cosmetic
+// "message port closed" warning on pages whose context dies before the
+// background finishes (YouTube SPAs, fast navigations).
 async function capturePageOnLoad() {
   try {
     const pageContent = getPageContent();
     console.log("[TeaWhiz] Content: Captured page on load, type:", pageContent.contentType, "length:", pageContent.content.length);
 
-    // Send to background for backend extraction
-    chrome.runtime.sendMessage(
-      {
+    try {
+      chrome.runtime.sendMessage({
         type: "CAPTURE_PAGE",
         content: pageContent.content,
         contentType: pageContent.contentType,
         title: pageContent.title,
         url: window.location.href,
-      },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          console.log("[TeaWhiz] Content: Background message failed:", chrome.runtime.lastError.message);
-        } else {
-          console.log("[TeaWhiz] Content: Page captured, backend response:", response?.status);
-        }
-      }
-    );
+      });
+    } catch (sendError) {
+      // Service worker may have just been torn down between page load and
+      // this call. Logged, not fatal - the popup will fall back to asking
+      // the content script directly via GET_PAGE_CONTENT if storage is empty.
+      console.log("[TeaWhiz] Content: sendMessage threw (worker reloading?):", String(sendError));
+    }
   } catch (error) {
     console.error("[TeaWhiz] Content: Failed to capture page on load:", error);
   }
@@ -345,10 +346,33 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   }
 });
 
-// Capture page on load (after a short delay to let the page render)
+// Capture page on load (after a short delay to let the page render).
+// Listen for both `load` (full page load) and `pageshow` (catches bfcache
+// restoration - back/forward navigation on SPA-heavy pages where the
+// content script is restored from cache and would otherwise miss the
+// re-capture window).
+let initialCaptureDone = false;
+function scheduleCapture(delayMs: number, force: boolean) {
+  setTimeout(() => {
+    if (force || !initialCaptureDone) {
+      initialCaptureDone = true;
+      void capturePageOnLoad();
+    }
+  }, delayMs);
+}
+
 window.addEventListener("load", () => {
   console.log("[TeaWhiz] Content: Page loaded, scheduling capture...");
-  setTimeout(capturePageOnLoad, 1500); // Wait for page to fully render
+  scheduleCapture(1500, false); // initial render delay
+});
+
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) {
+    // bfcache restore - re-capture because the DOM may have changed
+    // since the original capture, and storage may be stale.
+    console.log("[TeaWhiz] Content: Page restored from bfcache, re-capturing...");
+    scheduleCapture(500, true);
+  }
 });
 
 // Setup Netflix monitoring

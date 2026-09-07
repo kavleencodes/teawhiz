@@ -241,13 +241,20 @@ chrome.runtime.onMessage.addListener(
 
     if (request.type === "CAPTURE_PAGE") {
       console.log("[TeaWhiz] Background: Capturing page for URL:", request.url);
+      // Fire-and-forget: don't gate the work on a sendResponse callback. On
+      // SPAs (YouTube, etc.) the content script can unload before the
+      // callback fires, producing a spurious "message port closed" error
+      // even though the storage write still succeeds. Kick off the async
+      // work and let it run to completion in the service worker.
       handleCapturePage(
         request.content || "",
         request.contentType || "text",
         request.title || "",
         request.url || ""
       );
-      sendResponse({ success: true });
+      // Returning `true` keeps the channel open for any *other* message
+      // types that might need an async sendResponse. For CAPTURE_PAGE
+      // specifically, we don't call sendResponse at all.
       return false;
     }
   }
