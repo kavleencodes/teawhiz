@@ -120,7 +120,7 @@ function renderConvStartBanner() {
 
   const hint = document.createElement("div");
   hint.className = "conv-start-hint";
-  hint.textContent = "Click to copy \u2022 this id stays the same for every follow-up on this page";
+  hint.textContent = "Click to copy";
 
   banner.appendChild(label);
   banner.appendChild(id);
