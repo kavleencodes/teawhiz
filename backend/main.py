@@ -193,9 +193,20 @@ else:
 MAX_CACHE_ENTRIES = 5000
 response_cache: dict[str, dict] = {}
 
-def get_cache_key(text: str, action: str) -> str:
-    value = f"{action}:{text.strip()}"
-    return hashlib.sha256(value.encode()).hexdigest()
+# Cache version - bump when prompt structure changes so old cached answers
+# (from before history/system_context existed) don't get reused under a new
+# cache-key shape. Phase 1 introduction of conversation history = v2.
+CACHE_VERSION = "v2"
+
+def get_cache_key(text: str, action: str, history: list[dict] = None, system_context: str = "") -> str:
+    parts = [
+        CACHE_VERSION,
+        action,
+        (system_context or "").strip(),
+        json.dumps(history or [], sort_keys=True),
+        text.strip(),
+    ]
+    return hashlib.sha256(":".join(parts).encode()).hexdigest()
 
 def is_cache_valid(timestamp_iso: str, days: int = 7) -> bool:
     try:
@@ -204,8 +215,8 @@ def is_cache_valid(timestamp_iso: str, days: int = 7) -> bool:
     except Exception:
         return False
 
-def get_from_cache(text: str, action: str):
-    key = get_cache_key(text, action)
+def get_from_cache(text: str, action: str, history: list[dict] = None, system_context: str = ""):
+    key = get_cache_key(text, action, history, system_context)
     if key in response_cache:
         entry = response_cache[key]
         if is_cache_valid(entry["timestamp"]):
@@ -213,18 +224,63 @@ def get_from_cache(text: str, action: str):
         del response_cache[key]
     return None, False
 
-def save_to_cache(text: str, action: str, answer: str):
+def save_to_cache(text: str, action: str, answer: str, history: list[dict] = None, system_context: str = ""):
     if len(response_cache) >= MAX_CACHE_ENTRIES:
         # Evict oldest 10% entries if cache is full
         keys_to_remove = list(response_cache.keys())[:500]
         for k in keys_to_remove:
             response_cache.pop(k, None)
 
-    key = get_cache_key(text, action)
+    key = get_cache_key(text, action, history, system_context)
     response_cache[key] = {
         "answer": answer,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
+
+
+# Phase 2 helpers: in-memory page-context cache, keyed by SHA256 of
+# (url_hint + extracted clean text). Populated by /extract-context and
+# reused so /explain-stream doesn't re-run Trafilatura on every follow-up
+# turn. These were added to support the "extract DOM once, reuse across
+# the conversation" architecture introduced in commit 2b2e1be but never
+# actually landed in the file at that time.
+_page_context_cache: dict[str, dict] = {}
+MAX_PAGE_CONTEXT_ENTRIES = 1000
+
+def get_page_context_cache_key(cleaned_text: str, url_hint: str = "") -> str:
+    return hashlib.sha256(f"{url_hint}:{cleaned_text}".encode()).hexdigest()
+
+async def get_or_extract_page_context(
+    html: str,
+    url_hint: str = "",
+) -> str:
+    cleaned = await asyncio.to_thread(extract_clean_text, html)
+    if not cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Could not extract readable content from the page HTML",
+        )
+
+    key = get_page_context_cache_key(cleaned, url_hint)
+
+    if key in _page_context_cache:
+        entry = _page_context_cache[key]
+        if is_cache_valid(entry["timestamp"]):
+            print(f"[PageContext] Cache hit for key {key[:8]}...")
+            return entry["content"]
+        del _page_context_cache[key]
+
+    if len(_page_context_cache) >= MAX_PAGE_CONTEXT_ENTRIES:
+        keys_to_remove = list(_page_context_cache.keys())[:100]
+        for k in keys_to_remove:
+            _page_context_cache.pop(k, None)
+
+    _page_context_cache[key] = {
+        "content": cleaned,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    print(f"[PageContext] Extracted and cached {len(cleaned)} chars (key {key[:8]}...)")
+    return cleaned
 
 
 
@@ -258,6 +314,18 @@ class ExplainRequest(BaseModel):
     content_type: str = "text"
     question: Optional[str] = Field(default=None, max_length=MAX_QUESTION_LENGTH)  # user's question, appended after extraction
     title: Optional[str] = Field(default=None, max_length=MAX_TITLE_LENGTH)  # page title, prepended before the extracted content
+
+    # Phase 1 — conversation state. All optional so non-conversation callers
+    # (existing /explain one-offs, scripted tests) keep working unchanged.
+    # `history` is the prior turns (excluding the current question), each as
+    # {"role": "user"|"assistant", "content": "..."}. `system_context` is the
+    # frontend's pre-built "Page Title: ... Page Content: ..." block - sent
+    # every turn in Phase 1 (redundant with the page-extraction path, but
+    # avoids having to wire conversation ID -> stored page content until
+    # Phase 4's persistence layer exists).
+    conversation_id: Optional[str] = None
+    history: list[dict] = Field(default_factory=list)
+    system_context: Optional[str] = None
 
 class ExplainResponse(BaseModel):
     answer: str
@@ -384,8 +452,75 @@ async def build_cleaned_text(request: "ExplainRequest") -> str:
 
 
 
+# Maximum content length to send to the LLM. Groq's token limits vary by
+# model, but gpt-oss-120b has ~120k tokens context. Assuming 1 token ≈ 4
+# chars, 100k chars ≈ 25k tokens, leaving ~90k for system prompt + reasoning.
+# This is a safety net to prevent "messages too long" errors without having
+# to recompute token counts.
+MAX_LLM_CONTENT_LENGTH = 100_000
+
+def truncate_for_llm(text: str) -> str:
+    """Truncates oversized content before sending to the LLM, prioritizing
+    the *end* of the content (where the user's question typically is) over
+    earlier context. If truncation occurs, appends a marker so the LLM knows
+    some content was dropped."""
+    if len(text) <= MAX_LLM_CONTENT_LENGTH:
+        return text
+
+    # Chop from the start, keep the end (question) + last N chars of content
+    kept = text[-MAX_LLM_CONTENT_LENGTH:]
+    print(
+        f"[LLM] Truncated prompt: {len(text)} chars -> {len(kept)} chars "
+        f"({100 * len(kept) / len(text):.0f}% kept, start discarded)"
+    )
+    return f"[... content truncated ...]\n\n{kept}"
+
+
+def build_conversation_prompt(system_context: str, history: list[dict], question: str, base_template: str) -> str:
+    """Assembles the final prompt for the LLM from the page-context block,
+    the prior turns of the conversation, the current question, and the
+    action-specific framing template.
+
+    Order matters: system_context (page + title) first so the model grounds
+    every answer in the same source of truth, then chronological history,
+    then the current question framed by the action template.
+    """
+    history_lines = []
+    for msg in history or []:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if not content:
+            continue
+        speaker = "User" if role == "user" else "Assistant"
+        history_lines.append(f"{speaker}: {content}")
+    history_section = ("\n".join(history_lines) + "\n") if history_lines else ""
+
+    system_section = (system_context or "").strip()
+    if system_section and not system_section.endswith("\n"):
+        system_section += "\n"
+
+    full_context = ""
+    if system_section:
+        full_context += system_section + "\n"
+    if history_section:
+        full_context += "Conversation history:\n" + history_section + "\n"
+
+    full_text = full_context + f"User Question: {question}"
+
+    # Truncate before formatting the template so the "[... content truncated ...]"
+    # marker fits within the model's context window alongside the system prompt.
+    full_text = truncate_for_llm(full_text)
+
+    return base_template.format(text=full_text)
+
+
 ACTION_PROMPTS = {
-    "explain": "Analyze and explain the following webpage content in clear, concise terms. Focus on the main points and key information. Avoid repetition and be direct:\n\n{text}",
+    "explain": (
+        "You are a helpful assistant answering questions about webpage content. "
+        "Use the page content and conversation history below to answer the user's question.\n\n"
+        "{text}\n\n"
+        "Answer based on the conversation history and page content above:"
+    ),
     "simplify": "Rewrite the following text in simpler language while preserving the original meaning and all key details:\n\n{text}",
     "summarize": "Provide a 2-3 sentence summary of the main points from this webpage content:\n\n{text}",
     "translate": "Translate the following text to Hindi. Return only the Hindi translation without explanation:\n\n{text}",
@@ -500,6 +635,11 @@ async def get_groq_response(text: str, action: str = "explain") -> str:
         )
 
     template = ACTION_PROMPTS.get(action, ACTION_PROMPTS["explain"])
+
+    # Truncate oversized content to prevent "messages too long" errors from
+    # the LLM API, while prioritizing the user's question (at the end).
+    text = truncate_for_llm(text)
+
     prompt = template.format(text=text)
 
     try:
@@ -592,16 +732,31 @@ async def explain(
 
     cleaned_text = await build_cleaned_text(request)
 
-    # Check cache
-    cached_answer, from_cache = get_from_cache(cleaned_text, request.action)
+    # TEMP DEBUG — confirm what the popup actually sent
+    print(f"[DEBUG /explain-stream] question={request.question!r}")
+    print(f"[DEBUG /explain-stream] system_context_len={len(request.system_context or '')}")
+    print(f"[DEBUG /explain-stream] system_context_preview={(request.system_context or '')[:200]!r}")
+    print(f"[DEBUG /explain-stream] cleaned_text_len={len(cleaned_text)}")
+    print(f"[DEBUG /explain-stream] history_len={len(request.history)}")
+
+    prompt = build_conversation_prompt(
+        system_context=request.system_context or "",
+        history=request.history,
+        question=request.question or "",
+        base_template=ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]),
+    )
+
+    # Check cache (key includes history + system_context so different
+    # conversations / different pages don't collide)
+    cached_answer, from_cache = get_from_cache(prompt, request.action, request.history, request.system_context or "")
     if from_cache:
         return ExplainResponse(answer=cached_answer, cached=True)
 
     # Generate response
-    answer = await get_groq_response(cleaned_text, request.action)
+    answer = await get_groq_response(prompt, request.action)
 
     # Save to cache
-    save_to_cache(cleaned_text, request.action, answer)
+    save_to_cache(prompt, request.action, answer, request.history, request.system_context or "")
 
     return ExplainResponse(answer=answer, cached=False)
 
@@ -620,8 +775,23 @@ async def explain_stream(
 
     cleaned_text = await build_cleaned_text(request)
 
-    # Check cache
-    cached_answer, from_cache = get_from_cache(cleaned_text, request.action)
+    # TEMP DEBUG — confirm what the popup actually sent
+    print(f"[DEBUG /explain-stream] question={request.question!r}")
+    print(f"[DEBUG /explain-stream] system_context_len={len(request.system_context or '')}")
+    print(f"[DEBUG /explain-stream] system_context_preview={(request.system_context or '')[:200]!r}")
+    print(f"[DEBUG /explain-stream] cleaned_text_len={len(cleaned_text)}")
+    print(f"[DEBUG /explain-stream] history_len={len(request.history)}")
+
+    prompt = build_conversation_prompt(
+        system_context=request.system_context or "",
+        history=request.history,
+        question=request.question or "",
+        base_template=ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]),
+    )
+
+    # Check cache (key includes history + system_context so different
+    # conversations / different pages don't collide)
+    cached_answer, from_cache = get_from_cache(prompt, request.action, request.history, request.system_context or "")
     if from_cache:
         # Stream cached response in word chunks (like Claude)
         async def stream_cached():
@@ -640,16 +810,13 @@ async def explain_stream(
     # Get response from Groq and stream it
     async def stream_response():
         try:
-            template = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"])
-            prompt = template.format(text=cleaned_text)
-
             # Get full response from Groq, with the same retry/backoff +
             # fallback-model behavior used by the non-streaming /explain
             # path - without this, a transient 429 (or the primary model
             # being unavailable) fails the whole streamed answer instead of
             # transparently retrying/falling back.
             full_response = await _call_groq_with_fallback(prompt)
-            save_to_cache(cleaned_text, request.action, full_response)
+            save_to_cache(prompt, request.action, full_response, request.history, request.system_context or "")
 
             # Stream it in word chunks (like Claude)
             for chunk in chunk_preserving_whitespace(full_response, 15):

@@ -34,6 +34,11 @@ interface MessageRequest {
   word?: string;
   url?: string;  // For CAPTURE_PAGE
   pageContextHash?: string;  // For GET_ANSWER
+  // Phase 1 — conversation state, forwarded as-is from popup. Optional so
+  // any non-conversation caller (one-off scripted GET_ANSWER) still works.
+  conversationId?: string;
+  history?: Array<{ role: "user" | "assistant"; content: string }>;
+  systemContext?: string;
 }
 
 // Storage key prefix for page context
@@ -82,14 +87,19 @@ async function handleCapturePage(content: string, contentType: "html" | "text", 
 // Stream answer from backend in real-time. `content` is either plain text
 // (Netflix titles, DOM-text fallback) or the page's rendered outerHTML - the
 // backend runs Trafilatura extraction itself when contentType is "html", and
-// combines the result with `title`/`question` server-side.
+// combines the result with `title`/`question` server-side. Phase 1 adds the
+// optional conversation fields, which the backend passes straight through
+// into the prompt + cache key.
 async function streamAnswer(
   content: string,
   contentType: "html" | "text",
   title: string,
   question: string,
   tabId: number,
-  pageContextHash?: string
+  pageContextHash?: string,
+  conversationId?: string,
+  history?: Array<{ role: "user" | "assistant"; content: string }>,
+  systemContext?: string,
 ) {
   try {
     console.log("[TeaWhiz] Background: Fetching from", `${BACKEND_URL}/explain-stream`);
@@ -104,6 +114,9 @@ async function streamAnswer(
         question,
         action: "explain",
         page_context_hash: pageContextHash || undefined,
+        conversation_id: conversationId || undefined,
+        history: history || [],
+        system_context: systemContext || undefined,
       }),
     });
 
@@ -217,16 +230,27 @@ chrome.runtime.onMessage.addListener(
         "type:",
         request.contentType
       );
-      // Use streaming for real-time response
+      // Fire-and-forget: the actual answer chunks arrive back to the popup
+      // via `chrome.runtime.sendMessage({type:"RESPONSE_CHUNK", ...})`
+      // broadcasts from inside streamAnswer(), which the popup's
+      // onMessage listener picks up. There is no synchronous/async
+      // sendResponse payload for the popup's submit() callback - returning
+      // `true` here just keeps the channel open for nothing and produces
+      // the "listener indicated an asynchronous response by returning
+      // true, but the message channel closed before a response was
+      // received" warning in the popup console.
       streamAnswer(
         request.content,
         request.contentType || "text",
         request.title || "",
         request.question || "",
         sender.tab?.id || 0,
-        request.pageContextHash
+        request.pageContextHash,
+        request.conversationId,
+        request.history,
+        request.systemContext,
       );
-      return true;
+      return false;
     }
 
     if (request.type === "NORMALIZE_WORD") {

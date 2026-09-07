@@ -4,6 +4,84 @@ import { marked } from "marked";
 // GFM (tables, etc.) is on by default in marked v13+, but be explicit.
 marked.setOptions({ gfm: true, breaks: true });
 
+// Phase 1 — conversation state, persisted in chrome.storage.local so the
+// conversation survives popup close/reopen while staying scoped to the page
+// it was started on. The frontend owns this (the backend is still stateless
+// — it just receives `history` + `system_context` per request).
+interface Message {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: number;
+}
+
+interface ConversationState {
+  conversationId: string;
+  messages: Message[];
+  pageId: string;       // fingerprint of current page (URL + title) — drives restore-vs-reset
+  pageContext: string;  // page-context block the backend sees; rebuilt on every submit in Phase 1
+  pageTitle: string;
+}
+
+const CONVERSATION_KEY = "conversation_state";
+const CONVERSATION_SCHEMA_VERSION = 1; // bump if ConversationState shape changes incompatibly
+
+interface StoredConversation {
+  schemaVersion: number;
+  state: ConversationState;
+}
+
+function fingerprintPageId(url: string, title: string): string {
+  // Cheap, stable per-page identifier. URL alone would collide on SPA route
+  // changes; title alone is too volatile (some sites rewrite it constantly).
+  // Combining both gives a "this is the same article" signal without
+  // pulling in a real hash of content.
+  return `${url}::${title}`;
+}
+
+function newConversation(pageId: string, pageContext: string, pageTitle: string): ConversationState {
+  return {
+    conversationId: (crypto as any).randomUUID
+      ? (crypto as any).randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    messages: [],
+    pageId,
+    pageContext,
+    pageTitle,
+  };
+}
+
+let conversationState: ConversationState | null = null;
+
+async function loadConversation(pageId: string): Promise<ConversationState> {
+  const result = await chrome.storage.local.get(CONVERSATION_KEY);
+  const stored = result[CONVERSATION_KEY] as StoredConversation | undefined;
+
+  if (stored?.schemaVersion === CONVERSATION_SCHEMA_VERSION && stored.state?.pageId === pageId) {
+    // Same page as last time — restore the in-progress conversation so the
+    // user sees their prior turns and the LLM gets the history next ask.
+    return stored.state;
+  }
+  // Different page (or first ever open, or schema upgrade) — fresh conversation.
+  return newConversation(pageId, "", "");
+}
+
+async function persistConversation() {
+  if (!conversationState) return;
+  const payload: StoredConversation = {
+    schemaVersion: CONVERSATION_SCHEMA_VERSION,
+    state: conversationState,
+  };
+  await chrome.storage.local.set({ [CONVERSATION_KEY]: payload });
+}
+
+function buildSystemContext(): string {
+  if (!conversationState) return "";
+  const title = conversationState.pageTitle || "Untitled";
+  const content = conversationState.pageContext || "";
+  if (!content) return `Page Title: ${title}`;
+  return `Page Title: ${title}\n\nPage Content:\n${content}`;
+}
+
 const promptInput = document.getElementById("prompt") as HTMLTextAreaElement;
 const submitBtn = document.getElementById("submit") as HTMLButtonElement;
 const clearBtn = document.getElementById("clearBtn") as HTMLButtonElement;
@@ -28,7 +106,9 @@ const PAGE_CONTEXT_STORAGE_KEY_PREFIX = "pageContext:";
 let currentPageContext: { content: string; contentType: "html" | "text"; title: string; pageContextHash: string } | null = null;
 let currentPageUrl = "";
 
-// Load page context from storage (populated by background on page load)
+// Load page context from storage (populated by background on page load).
+// Also kicks off conversation restore — both come from chrome.storage.local
+// and we want them loaded before the user can submit.
 async function loadPageContext() {
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -36,10 +116,13 @@ async function loadPageContext() {
 
     currentPageUrl = tabs[0].url || "";
     const key = `${PAGE_CONTEXT_STORAGE_KEY_PREFIX}${currentPageUrl}`;
-    const result = await chrome.storage.local.get(key);
 
-    if (result[key]) {
-      currentPageContext = result[key] as typeof currentPageContext;
+    const [pageResult] = await Promise.all([
+      chrome.storage.local.get(key),
+    ]);
+
+    if (pageResult[key]) {
+      currentPageContext = pageResult[key] as typeof currentPageContext;
       console.log("[TeaWhiz] Popup: Loaded page context from storage:", {
         contentType: currentPageContext?.contentType,
         length: currentPageContext?.content?.length,
@@ -62,13 +145,46 @@ async function loadPageContext() {
             };
             promptInput.placeholder = "Ask about this page...";
             console.log("[TeaWhiz] Popup: Page content loaded from content script");
+            // Conversation depends on title — re-resolve now that we have it.
+            void initializeConversation();
           }
         }
       );
     }
+
+    // Initialise / restore conversation immediately if we already have the title.
+    await initializeConversation();
   } catch (error) {
     console.log("[TeaWhiz] Popup: Could not load page context:", error);
   }
+}
+
+// Resolves conversation state for the current page and re-renders any prior
+// turns so reopening the popup shows the user where they left off. Called
+// once after page-context is known (and again from the GET_PAGE_CONTENT
+// fallback if the title wasn't available synchronously).
+async function initializeConversation() {
+  const title = currentPageContext?.title || "";
+  const pageId = fingerprintPageId(currentPageUrl, title);
+
+  conversationState = await loadConversation(pageId);
+
+  // Phase 1: rebuild pageContext from the cached page context blob every
+  // turn in submit() — no need to seed it here. We just stash the title so
+  // the clear button / re-render paths can read it without re-querying.
+  conversationState.pageTitle = title;
+  conversationState.pageId = pageId;
+
+  // Re-render any previously persisted turns so the popup reflects the
+  // restored conversation immediately on open.
+  if (conversationState.messages.length > 0) {
+    messagesContainer.innerHTML = "";
+    for (const msg of conversationState.messages) {
+      showMessage(msg.content, msg.role, /*persist*/ false);
+    }
+  }
+
+  await persistConversation();
 }
 
 loadPageContext();
@@ -172,12 +288,24 @@ promptInput.addEventListener("input", () => {
   promptInput.style.height = Math.min(promptInput.scrollHeight, 100) + "px";
 });
 
-// Clear button
-clearBtn.addEventListener("click", () => {
+// Clear button — start a fresh conversation on the SAME page. We drop
+// every prior turn (so the LLM stops seeing them on the next ask) but
+// keep the cached page context blob, so re-extraction isn't needed and
+// the popup doesn't suddenly lose its "Ask about this page..." placeholder.
+clearBtn.addEventListener("click", async () => {
   promptInput.value = "";
   messagesContainer.innerHTML = "";
   responseContainer.classList.remove("active");
   chrome.storage.local.set({ savedPrompt: "" });
+
+  if (currentPageContext) {
+    conversationState = newConversation(
+      fingerprintPageId(currentPageUrl, currentPageContext.title),
+      currentPageContext.content,
+      currentPageContext.title,
+    );
+    await persistConversation();
+  }
   promptInput.focus();
 });
 
@@ -242,6 +370,11 @@ promptInput.addEventListener("keydown", (e) => {
   }
 });
 
+// In-flight assistant reply, accumulated as chunks arrive so we can append
+// the full text to conversationState on RESPONSE_DONE (instead of trying
+// to reverse-engineer it from the rendered DOM).
+let currentAssistantText = "";
+
 function submit() {
   const userQuestion = promptInput.value.trim();
 
@@ -251,7 +384,7 @@ function submit() {
     return;
   }
 
-  if (!currentPageContext) {
+  if (!currentPageContext || !conversationState) {
     showMessage("Please wait - page content not yet loaded.", "error");
     return;
   }
@@ -261,6 +394,12 @@ function submit() {
   if (oldResponse) {
     oldResponse.parentElement?.remove();
   }
+
+  // Stash the latest page context + title on the conversation so the backend
+  // sees a consistent systemContext on every turn in this conversation.
+  conversationState.pageContext = currentPageContext.content;
+  conversationState.pageTitle = currentPageContext.title;
+  conversationState.pageId = fingerprintPageId(currentPageUrl, currentPageContext.title);
 
   showMessage(userQuestion, "user");
 
@@ -274,39 +413,46 @@ function submit() {
 
   showLoading();
 
+  // History sent to the backend = the conversation *so far*, before the
+  // turn we're about to submit. (The current question is already in
+  // `question`; sending it again in `history` would double-count.)
+  const history = conversationState.messages
+    .filter((m) => m.content !== userQuestion) // safety: user message is already pushed via showMessage
+    .map((m) => ({ role: m.role, content: m.content }));
+
+  const systemContext = buildSystemContext();
+
   console.log("[TeaWhiz] Popup: Sending GET_ANSWER to background", {
     hasPageContext: !!currentPageContext,
     contentType: currentPageContext.contentType,
     contentLength: currentPageContext.content.length,
     userQuestion: userQuestion,
     pageContextHash: currentPageContext.pageContextHash,
+    conversationId: conversationState.conversationId,
+    historyLength: history.length,
+    systemContextLength: systemContext.length,
   });
 
-  chrome.runtime.sendMessage(
-    {
-      type: "GET_ANSWER",
-      content: currentPageContext.content,
-      contentType: currentPageContext.contentType,
-      title: currentPageContext.title,
-      question: userQuestion,
-      pageContextHash: currentPageContext.pageContextHash,
-    },
-    (response) => {
-      console.log("[TeaWhiz] Popup: Got callback response:", response);
-      stopLoading();
-      submitBtn.disabled = false;
-      submitBtn.textContent = "⬆";
+  currentAssistantText = "";
 
-      if (response?.success) {
-        // Response will come as chunks
-      } else {
-        showMessage(response?.error || "Failed to get response", "error");
-      }
-    }
-  );
+  // Fire-and-forget: the response itself arrives as RESPONSE_CHUNK /
+  // RESPONSE_DONE messages on the onMessage listener below, NOT as the
+  // callback to sendMessage. Passing a callback (and returning true from
+  // background) just produces the "channel closed before response" warning.
+  chrome.runtime.sendMessage({
+    type: "GET_ANSWER",
+    content: currentPageContext.content,
+    contentType: currentPageContext.contentType,
+    title: currentPageContext.title,
+    question: userQuestion,
+    pageContextHash: currentPageContext.pageContextHash,
+    conversationId: conversationState.conversationId,
+    history,
+    systemContext,
+  });
 }
 
-function showMessage(text: string, type: "user" | "assistant" | "error") {
+function showMessage(text: string, type: "user" | "assistant" | "error", persist: boolean = true) {
   const messageEl = document.createElement("div");
   messageEl.className = `message ${type}`;
 
@@ -323,6 +469,18 @@ function showMessage(text: string, type: "user" | "assistant" | "error") {
   messageEl.appendChild(contentEl);
   messagesContainer.appendChild(messageEl);
   expandResponseArea();
+
+  // Persist user/assistant turns to conversation state so the popup can be
+  // closed/reopened and pick back up. Errors stay in-memory only — they
+  // aren't part of the conversation the LLM should see on the next ask.
+  if (persist && conversationState && (type === "user" || type === "assistant")) {
+    conversationState.messages.push({
+      role: type,
+      content: text,
+      timestamp: Date.now(),
+    });
+    void persistConversation();
+  }
 
   // Scroll to bottom
   setTimeout(() => {
@@ -419,6 +577,10 @@ chrome.runtime.onMessage.addListener((request) => {
       // Get accumulated text and add new chunk
       let fullText = responseEl.getAttribute("data-raw-text") || "";
       fullText += request.text;
+      // Mirror the rendered text into the module-level accumulator so
+      // RESPONSE_DONE can persist it to conversation history (we don't
+      // parse it back out of the DOM).
+      currentAssistantText = fullText;
       console.log("[TeaWhiz] Popup: Accumulated text length:", fullText.length);
 
       // Store raw text and render markdown
@@ -436,6 +598,25 @@ chrome.runtime.onMessage.addListener((request) => {
     stopLoading();
     submitBtn.disabled = false;
     submitBtn.textContent = "⬆";
+
+    // Persist the just-completed assistant turn so the next ask's history
+    // includes it. showMessage() with persist=true also pushes a copy, so
+    // we append only if the rendered DOM exists and the accumulator has
+    // something fresh — guards against double-pushing on re-emits.
+    if (conversationState && currentAssistantText) {
+      const alreadyPersisted = conversationState.messages.some(
+        (m) => m.role === "assistant" && m.content === currentAssistantText
+      );
+      if (!alreadyPersisted) {
+        conversationState.messages.push({
+          role: "assistant",
+          content: currentAssistantText,
+          timestamp: Date.now(),
+        });
+        void persistConversation();
+      }
+    }
+    currentAssistantText = "";
   } else if (request.type === "RESPONSE_ERROR") {
     console.log("[TeaWhiz] Popup: Got error:", request.error);
     stopLoading();
