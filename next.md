@@ -351,23 +351,24 @@ Manage the context window so it doesn't grow unbounded. Implement:
 
 ### Context Window Budget
 
-Groq's context window for `openai/gpt-oss-120b` is large (~128K tokens), but we still need to manage it. We explicitly separate INPUT context (what we send to the LLM) from OUTPUT budget (reserved for the response):
+Groq's context window for `openai/gpt-oss-120b` is large (~128K tokens), but the free tier enforces an **8K tokens-per-minute per-request rate limit**. We budget against that practical ceiling, not the nominal window.
 
-**INPUT CONTEXT BUDGET** (managed by Context Manager):
-| Component | Budget (tokens) | Notes |
-|-----------|-----------------|-------|
-| System instructions | ~100 | Minimal prompt framing |
-| Page context | ~4,000 | Truncate to first 2000 words if longer |
-| Recent messages | ~3,000 | Last 5-8 turns (~500 tokens each) |
-| Summary | ~500 | When conversation is long |
-| Current question | ~200 | User's current input |
+**APPLICATION INPUT BUDGET** (hard cap: ~8,000 tokens = ~32,000 chars):
+| Component | Budget (tokens) | Budget (chars) | Notes |
+|-----------|-----------------|----------------|-------|
+| System instructions | ~100 | ~400 | Minimal prompt framing |
+| Page context (truncated) | ~2,000 | ~8,000 | Capped at first ~2000 words |
+| Recent messages | ~3,000 | ~12,000 | Last 5-8 turns (~500 tokens each) |
+| Summary | ~500 | ~2,000 | When conversation is long |
+| Current question | ~200 | ~800 | User's current input |
+| **Total** | **~5,800** | **~23,200** | Leaves ~2,200 tokens headroom |
 
 **OUTPUT BUDGET** (separate):
 | Component | Budget (tokens) |
 |-----------|-----------------|
 | MAX_OUTPUT_TOKENS | ~1,000 |
 
-The context manager calculates `input_tokens + max_output_tokens < MODEL_CONTEXT_WINDOW` and enforces truncation.
+The context manager enforces `input_tokens + MAX_OUTPUT_TOKENS <= APPLICATION_INPUT_BUDGET` (≈8K), not the model's 128K nominal window.
 
 > Note: The `4 chars ≈ 1 token` approximation is acceptable for Phase 3. Production should use proper token counting.
 
@@ -382,39 +383,48 @@ from typing import Optional
 @dataclass
 class ConversationContext:
     conversation_id: str
-    page_context: str           # extracted page text
+    page_context: str           # full extracted page text (cached)
     title: str = ""
     messages: list[dict] = field(default_factory=list)  # [{"role": ..., "content": ...}]
     summary: Optional[str] = None  # "So far we've discussed X and Y..."
 
     # Token budget constants (char-based for now, ~4 chars/token)
     MODEL_CONTEXT_WINDOW = 128_000
+    APPLICATION_INPUT_BUDGET = 8_000   # tokens (free-tier TPM limit)
     MAX_OUTPUT_TOKENS = 1_000
     CHARS_PER_TOKEN = 4
+
+    # Derived budgets
+    INPUT_CHAR_BUDGET = (APPLICATION_INPUT_BUDGET - MAX_OUTPUT_TOKENS) * CHARS_PER_TOKEN  # ~28,000 chars
+    PAGE_CONTEXT_MAX_WORDS = 2000
+    PAGE_CONTEXT_MAX_CHARS = 8_000  # hard cap on page context section
+
+    def get_effective_page_context(self) -> str:
+        """Returns the page context as it will actually appear in the prompt (truncated)."""
+        page_words = self.page_context.split()[:self.PAGE_CONTEXT_MAX_WORDS]
+        page_text = " ".join(page_words)
+        page_section = f"Page Title: {self.title or 'Unknown'}\n\nPage Content:\n{page_text}"
+        if len(page_section) > self.PAGE_CONTEXT_MAX_CHARS:
+            # Truncate to fit hard cap
+            keep_chars = self.PAGE_CONTEXT_MAX_CHARS - len("Page Title: \n\nPage Content:\n")
+            page_text = page_text[:keep_chars]
+            page_section = f"Page Title: {self.title or 'Unknown'}\n\nPage Content:\n{page_text}"
+        return page_section
 
     def get_context_window(self, question: str) -> str:
         """
         Build a context-aware prompt within token budget.
         Strategy:
-          1. Always include page context (truncated if needed)
+          1. Always include page context (truncated to effective size)
           2. Include summary (if any) as bridge between older messages and recent ones
           3. Include recent messages (as many as fit)
           4. Include current question
         """
-        # Input budget = total window - output reserve
-        input_token_budget = self.MODEL_CONTEXT_WINDOW - self.MAX_OUTPUT_TOKENS
-        char_budget = input_token_budget * self.CHARS_PER_TOKEN
-
+        remaining = self.INPUT_CHAR_BUDGET
         parts: list[str] = []
-        remaining = char_budget
 
-        # 1. Page context (highest priority, but cap at 2000 words)
-        page_words = self.page_context.split()[:2000]
-        page_text = " ".join(page_words)
-        page_section = f"Page Title: {self.title or 'Unknown'}\n\nPage Content:\n{page_text}"
-        if len(page_section) > remaining * 0.5:  # cap page at 50% of budget
-            page_text = " ".join(page_words[:int(len(page_words) * remaining * 0.5 / len(page_section))])
-            page_section = f"Page Title: {self.title or 'Unknown'}\n\nPage Content:\n{page_text}"
+        # 1. Page context (highest priority, use effective/truncated version)
+        page_section = self.get_effective_page_context()
         parts.append(page_section)
         remaining -= len(page_section)
 
@@ -437,16 +447,21 @@ class ConversationContext:
         return "\n\n---\n\n".join(parts)
 
     def _build_recent_section(self, char_budget: int) -> str:
-        """Build recent messages section fitting within budget."""
+        """Build recent messages section fitting within budget.
+        
+        Returns the last N *messages* (not turns) that fit, where a message
+        is a single user or assistant entry. This keeps "recent history"
+        defined consistently as message count.
+        """
         lines: list[str] = []
         used_chars = 0
 
-        # Iterate backwards through messages
+        # Iterate backwards through messages (most recent first)
         for msg in reversed(self.messages):
             line = f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
             if used_chars + len(line) + 2 > char_budget:
                 break
-            lines.insert(0, line)  # prepend to maintain order
+            lines.insert(0, line)  # prepend to maintain chronological order
             used_chars += len(line) + 1
 
         return "\n".join(lines) if lines else ""
@@ -454,24 +469,25 @@ class ConversationContext:
     def should_summarize(self) -> bool:
         """
         Summarize when estimated context size exceeds threshold.
-        This is context-size-based, not message-count-based.
+        Uses the *effective* (truncated) page context size, not the raw page size.
         """
-        # Estimate tokens: page + messages + summary + question
+        # Estimate tokens using effective page context + messages + summary + question buffer
+        effective_page = self.get_effective_page_context()
         estimated_chars = (
-            len(self.page_context) +
+            len(effective_page) +
             sum(len(m['content']) for m in self.messages) +
             len(self.summary or "") +
             500  # buffer for question + prompt overhead
         )
         estimated_tokens = estimated_chars / self.CHARS_PER_TOKEN
         # Trigger when we'd exceed ~75% of input budget
-        return estimated_tokens > (self.MODEL_CONTEXT_WINDOW - self.MAX_OUTPUT_TOKENS) * 0.75
+        return estimated_tokens > (self.APPLICATION_INPUT_BUDGET - self.MAX_OUTPUT_TOKENS) * 0.75
 
     def update_summary(self, summary: str):
         self.summary = summary
 ```
 
-#### Backend — Auto-summarize Trigger
+#### Backend — Auto-summarize Trigger (carries forward previous summary)
 
 ```python
 async def check_and_summarize(context: ConversationContext) -> Optional[str]:
@@ -482,21 +498,28 @@ async def check_and_summarize(context: ConversationContext) -> Optional[str]:
     # Build condensed history for summary
     # Keep last 5 messages as "recent" (they're still fresh in context)
     old_messages = context.messages[:-5]
+    if not old_messages:
+        return None
+
     history_for_summary = "\n".join(
         f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
         for m in old_messages
     )
 
+    # Include previous summary as context so the new summary builds on it
+    previous_summary = f"\n\nPrevious summary: {context.summary}\n" if context.summary else ""
+
     summary_prompt = (
         "Summarize this conversation briefly, capturing the key topics and questions discussed. "
-        "Return a 2-3 sentence summary in the style: 'In this conversation we discussed X, Y, and Z.'\n\n"
+        "Return a 2-3 sentence summary in the style: 'In this conversation we discussed X, Y, and Z.'"
+        f"{previous_summary}\n\n"
         f"{history_for_summary}"
     )
 
     try:
         summary = await _call_groq_with_fallback(summary_prompt)
         context.update_summary(summary)
-        # Trim old messages we just summarized
+        # Trim old messages we just summarized (keep last 5)
         context.messages = context.messages[-5:]
         return summary
     except Exception as e:
@@ -539,11 +562,13 @@ def get_or_create_conversation(conversation_id: str, page_context: str, title: s
 ```
 
 ### Verification Checklist
-- [ ] Context window budget: input tokens + MAX_OUTPUT_TOKENS < MODEL_CONTEXT_WINDOW
-- [ ] Very long page: truncated to ~2000 words, doesn't overflow context
+- [ ] Context window budget: input tokens + MAX_OUTPUT_TOKENS <= APPLICATION_INPUT_BUDGET (~8K)
+- [ ] Very long page: truncated to ~2000 words / 8000 chars, doesn't overflow context
 - [ ] Context manager enforces truncation and respects output budget
 - [ ] LLM answers reference summarized history correctly
-- [ ] Summary trigger based on context size (~75% of input budget), not message count
+- [ ] Summary trigger based on effective context size (~75% of input budget), not raw page size
+- [ ] New summary incorporates previous summary (carries forward context)
+- [ ] Recent history defined consistently as *messages* (not turns)
 
 ---
 
