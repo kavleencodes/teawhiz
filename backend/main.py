@@ -396,54 +396,23 @@ def resolve_question(question: str) -> str:
 
 
 async def build_cleaned_text(request: "ExplainRequest") -> str:
-    """Resolves an ExplainRequest down to the plain-text prompt content.
-
-    Handles both content types (raw text, or rendered HTML needing
-    Trafilatura extraction), prepends the optional page title, and appends
-    the optional user question - so both /explain and /explain-stream share
-    one code path. Content and question are handled independently: if page
-    extraction comes back empty (or wasn't attempted) but a question was
-    asked, the question alone is still a valid prompt.
-
-    PROBLEM (fixed): this function used to be synchronous (`def`, not
-    `async def`) and called `extract_clean_text()` directly. Trafilatura's
-    parse is synchronous/CPU-bound, so running it inline blocked FastAPI's
-    single asyncio event loop for the *whole process* while it parsed large
-    rendered pages (up to 2MB of HTML) - stalling every other in-flight
-    request on that worker, including other users' SSE streams, for as long
-    as parsing took.
-    SOLUTION: made this function `async` and offloaded the extraction call
-    to a worker thread via `await asyncio.to_thread(...)` below - the same
-    pattern already used for the Groq API call - so the event loop stays
-    free while Trafilatura runs.
+    """Extracts and returns the page content (title + extracted text) only.
+    
+    Does NOT append the user's question - that's added by build_conversation_prompt.
+    Uses the page context cache so Trafilatura runs once per page.
     """
     raw = request.text.strip()
 
     if request.content_type == "html":
         if not raw:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
-        # No manual length check here anymore - `ExplainRequest.text`'s
-        # `Field(max_length=MAX_HTML_LENGTH)` already rejects an over-limit
-        # payload at the request-body validation layer (a clean 422 before
-        # this function ever runs), so a redundant check here would be dead
-        # code that could never actually trigger.
-        content = await asyncio.to_thread(extract_clean_text, raw)
-        if not content:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Could not extract readable content from the page HTML",
-            )
+        content = await get_or_extract_page_context(raw, url_hint=request.title)
     else:
         content = raw
 
     title = (request.title or "").strip()
     if title:
         content = f"Page Title: {title}\n\nContent:\n{content}" if content else f"Page Title: {title}"
-
-    question = (request.question or "").strip()
-    if question:
-        question = resolve_question(question)
-        content = f"{content}\n\n---\n\nUser Question: {question}" if content else f"User Question: {question}"
 
     if not content.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty")
@@ -744,14 +713,16 @@ async def explain(
     cleaned_text = await build_cleaned_text(request)
 
     # TEMP DEBUG — confirm what the popup actually sent
-    print(f"[DEBUG /explain-stream] question={request.question!r}")
-    print(f"[DEBUG /explain-stream] system_context_len={len(request.system_context or '')}")
-    print(f"[DEBUG /explain-stream] system_context_preview={(request.system_context or '')[:200]!r}")
-    print(f"[DEBUG /explain-stream] cleaned_text_len={len(cleaned_text)}")
-    print(f"[DEBUG /explain-stream] history_len={len(request.history)}")
+    print(f"[DEBUG /explain] question={request.question!r}")
+    print(f"[DEBUG /explain] system_context_len={len(request.system_context or '')}")
+    print(f"[DEBUG /explain] system_context_preview={(request.system_context or '')[:200]!r}")
+    print(f"[DEBUG /explain] cleaned_text_len={len(cleaned_text)}")
+    print(f"[DEBUG /explain] history_len={len(request.history)}")
 
+    # Use cleaned_text (cached page content) as system_context for the prompt.
+    # Frontend's system_context is ignored in favor of server-cached content.
     prompt = build_conversation_prompt(
-        system_context=request.system_context or "",
+        system_context=cleaned_text,
         history=request.history,
         question=request.question or "",
         base_template=ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]),
@@ -759,7 +730,7 @@ async def explain(
 
     # Check cache (key includes history + system_context so different
     # conversations / different pages don't collide)
-    cached_answer, from_cache = get_from_cache(prompt, request.action, request.history, request.system_context or "")
+    cached_answer, from_cache = get_from_cache(prompt, request.action, request.history, cleaned_text)
     if from_cache:
         return ExplainResponse(answer=cached_answer, cached=True)
 
@@ -767,7 +738,7 @@ async def explain(
     answer = await get_groq_response(prompt, request.action)
 
     # Save to cache
-    save_to_cache(prompt, request.action, answer, request.history, request.system_context or "")
+    save_to_cache(prompt, request.action, answer, request.history, cleaned_text)
 
     return ExplainResponse(answer=answer, cached=False)
 
@@ -793,8 +764,10 @@ async def explain_stream(
     print(f"[DEBUG /explain-stream] cleaned_text_len={len(cleaned_text)}")
     print(f"[DEBUG /explain-stream] history_len={len(request.history)}")
 
+    # Use cleaned_text (cached page content) as system_context for the prompt.
+    # Frontend's system_context is ignored in favor of server-cached content.
     prompt = build_conversation_prompt(
-        system_context=request.system_context or "",
+        system_context=cleaned_text,
         history=request.history,
         question=request.question or "",
         base_template=ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]),
@@ -802,7 +775,7 @@ async def explain_stream(
 
     # Check cache (key includes history + system_context so different
     # conversations / different pages don't collide)
-    cached_answer, from_cache = get_from_cache(prompt, request.action, request.history, request.system_context or "")
+    cached_answer, from_cache = get_from_cache(prompt, request.action, request.history, cleaned_text)
     if from_cache:
         # Stream cached response in word chunks (like Claude)
         async def stream_cached():
@@ -827,7 +800,7 @@ async def explain_stream(
             # being unavailable) fails the whole streamed answer instead of
             # transparently retrying/falling back.
             full_response = await _call_groq_with_fallback(prompt)
-            save_to_cache(prompt, request.action, full_response, request.history, request.system_context or "")
+            save_to_cache(prompt, request.action, full_response, request.history, cleaned_text)
 
             # Stream it in word chunks (like Claude)
             for chunk in chunk_preserving_whitespace(full_response, 15):
