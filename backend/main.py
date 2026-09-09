@@ -283,6 +283,183 @@ async def get_or_extract_page_context(
     return cleaned
 
 
+# Phase 3 — Context Window Management
+# Manages conversation context within the practical token budget (8K TPM limit on Groq free tier).
+# Budget (chars, ~4 chars/token):
+#   - Page context (truncated): 8,000 chars (~2,000 tokens)
+#   - Recent messages: ~12,000 chars (~3,000 tokens)
+#   - Summary: ~2,000 chars (~500 tokens)
+#   - System/question overhead: ~1,200 chars (~300 tokens)
+#   Total input: ~23,200 chars, leaving headroom for 1,024 output tokens under 8K TPM cap.
+
+from dataclasses import dataclass, field
+from typing import Optional, List
+
+@dataclass
+class ConversationContext:
+    conversation_id: str
+    page_context: str           # full extracted page text (cached)
+    title: str = ""
+    messages: List[dict] = field(default_factory=list)  # [{"role": ..., "content": ...}]
+    summary: Optional[str] = None  # "So far we've discussed X and Y..."
+
+    # Token budget constants (char-based for now, ~4 chars/token)
+    MODEL_CONTEXT_WINDOW = 128_000
+    APPLICATION_INPUT_BUDGET = 8_000   # tokens (free-tier TPM limit)
+    MAX_OUTPUT_TOKENS = 1_024
+    CHARS_PER_TOKEN = 4
+
+    # Derived budgets
+    INPUT_CHAR_BUDGET = (APPLICATION_INPUT_BUDGET - MAX_OUTPUT_TOKENS) * CHARS_PER_TOKEN  # ~28,000 chars
+    PAGE_CONTEXT_MAX_WORDS = 2000
+    PAGE_CONTEXT_MAX_CHARS = 8_000  # hard cap on page context section
+
+    def get_effective_page_context(self) -> str:
+        """Returns the page context as it will actually appear in the prompt (truncated)."""
+        page_words = self.page_context.split()[:self.PAGE_CONTEXT_MAX_WORDS]
+        page_text = " ".join(page_words)
+        page_section = f"Page Title: {self.title or 'Unknown'}\n\nPage Content:\n{page_text}"
+        if len(page_section) > self.PAGE_CONTEXT_MAX_CHARS:
+            keep_chars = self.PAGE_CONTEXT_MAX_CHARS - len("Page Title: \n\nPage Content:\n")
+            page_text = page_text[:keep_chars]
+            page_section = f"Page Title: {self.title or 'Unknown'}\n\nPage Content:\n{page_text}"
+        return page_section
+
+    def get_context_window(self, question: str) -> str:
+        """
+        Build a context-aware prompt within token budget.
+        Strategy:
+          1. Always include page context (truncated to effective size)
+          2. Include summary (if any) as bridge between older messages and recent ones
+          3. Include recent messages (as many as fit)
+          4. Include current question
+        """
+        remaining = self.INPUT_CHAR_BUDGET
+        parts: List[str] = []
+
+        # 1. Page context (highest priority, use effective/truncated version)
+        page_section = self.get_effective_page_context()
+        parts.append(page_section)
+        remaining -= len(page_section)
+
+        # 2. Summary (if conversation is long)
+        if self.summary:
+            summary_section = f"\n[Earlier in this conversation: {self.summary}]\n"
+            if len(summary_section) < remaining:
+                parts.append(summary_section)
+                remaining -= len(summary_section)
+
+        # 3. Recent messages (fit as many as possible)
+        recent_section = self._build_recent_section(remaining)
+        parts.append(recent_section)
+        remaining -= len(recent_section)
+
+        # 4. Current question
+        question_section = f"\nUser Question: {question}"
+        parts.append(question_section)
+
+        return "\n\n---\n\n".join(parts)
+
+    def _build_recent_section(self, char_budget: int) -> str:
+        """Build recent messages section fitting within budget.
+        
+        Returns the last N *messages* (not turns) that fit, where a message
+        is a single user or assistant entry. This keeps "recent history"
+        defined consistently as message count.
+        """
+        lines: List[str] = []
+        used_chars = 0
+
+        # Iterate backwards through messages (most recent first)
+        for msg in reversed(self.messages):
+            line = f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+            if used_chars + len(line) + 2 > char_budget:
+                break
+            lines.insert(0, line)  # prepend to maintain chronological order
+            used_chars += len(line) + 1
+
+        return "\n".join(lines) if lines else ""
+
+    def should_summarize(self) -> bool:
+        """
+        Summarize when estimated context size exceeds threshold.
+        Uses the *effective* (truncated) page context size, not the raw page size.
+        """
+        # Estimate tokens using effective page context + messages + summary + question buffer
+        effective_page = self.get_effective_page_context()
+        estimated_chars = (
+            len(effective_page) +
+            sum(len(m['content']) for m in self.messages) +
+            len(self.summary or "") +
+            500  # buffer for question + prompt overhead
+        )
+        estimated_tokens = estimated_chars / self.CHARS_PER_TOKEN
+        # Trigger when we'd exceed ~75% of input budget
+        return estimated_tokens > (self.APPLICATION_INPUT_BUDGET - self.MAX_OUTPUT_TOKENS) * 0.75
+
+    def update_summary(self, summary: str):
+        self.summary = summary
+
+
+# Simple in-memory store for active conversations
+# Phase 4 replaces this with PostgreSQL
+_active_conversations: dict[str, ConversationContext] = {}
+
+def get_or_create_conversation(conversation_id: str, page_context: str, title: str = "") -> ConversationContext:
+    if conversation_id not in _active_conversations:
+        _active_conversations[conversation_id] = ConversationContext(
+            conversation_id=conversation_id,
+            page_context=page_context,
+            title=title,
+        )
+    return _active_conversations[conversation_id]
+
+async def check_and_summarize(context: ConversationContext) -> Optional[str]:
+    """If context size exceeds threshold, summarize older messages via LLM."""
+    if not context.should_summarize():
+        return None
+
+    # Build condensed history for summary
+    # Keep last 5 messages as "recent" (they're still fresh in context)
+    old_messages = context.messages[:-5]
+    if not old_messages:
+        return None
+
+    # Limit history for summary to ~15000 chars (~3750 tokens) to fit within model limits
+    # Use the most recent old messages (closest to the 5 we're keeping)
+    max_summary_history_chars = 15000
+    history_for_summary = ""
+    for m in reversed(old_messages):
+        line = f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+        if len(history_for_summary) + len(line) > max_summary_history_chars:
+            break
+        history_for_summary = line + "\n" + history_for_summary  # prepend to maintain chronological order
+
+    if not history_for_summary:
+        return None
+
+    # Include previous summary as context so the new summary builds on it
+    previous_summary = f"\n\nPrevious summary: {context.summary}\n" if context.summary else ""
+
+    summary_prompt = (
+        "Summarize this conversation briefly, capturing the key topics and questions discussed. "
+        "Return a 2-3 sentence summary in the style: 'In this conversation we discussed X, Y, and Z.'"
+        f"{previous_summary}\n\n"
+        f"{history_for_summary}"
+    )
+
+    try:
+        summary = await _call_groq_with_fallback(summary_prompt)
+        context.update_summary(summary)
+        # Trim old messages we just summarized (keep last 5)
+        context.messages = context.messages[-5:]
+        print(f"[Context] Generated summary for conversation {context.conversation_id[:8]}...")
+        return summary
+    except Exception as e:
+        print(f"⚠️ Summary generation failed: {e}")
+        return None
+
+
 
 # PROBLEM (fixed): `MAX_HTML_LENGTH` used to only be checked manually, and
 # only when `content_type == "html"`. Plain-text `text` (the default
@@ -719,14 +896,31 @@ async def explain(
     print(f"[DEBUG /explain] cleaned_text_len={len(cleaned_text)}")
     print(f"[DEBUG /explain] history_len={len(request.history)}")
 
-    # Use cleaned_text (cached page content) as system_context for the prompt.
-    # Frontend's system_context is ignored in favor of server-cached content.
+    # Phase 3: Use ConversationContext for context window management
+    conversation_id = request.conversation_id or "default"
+    context = get_or_create_conversation(conversation_id, cleaned_text, request.title or "")
+
+    # Sync messages from frontend (they're the source of truth for the conversation)
+    if request.history:
+        context.messages = request.history
+
+    # Add current user question to context
+    if request.question:
+        context.messages.append({"role": "user", "content": request.question})
+
+    # Check if summarization is needed
+    await check_and_summarize(context)
+
+    # Build prompt using context window manager
     prompt = build_conversation_prompt(
-        system_context=cleaned_text,
-        history=request.history,
+        system_context="",  # Not used - context manager handles page context
+        history=[],  # Not used - context manager handles recent messages
         question=request.question or "",
         base_template=ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]),
     )
+    # Override with context-aware prompt
+    prompt = context.get_context_window(request.question or "")
+    prompt = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]).format(text=prompt)
 
     # Check cache (key includes history + system_context so different
     # conversations / different pages don't collide)
@@ -736,6 +930,9 @@ async def explain(
 
     # Generate response
     answer = await get_groq_response(prompt, request.action)
+
+    # Add assistant response to context
+    context.messages.append({"role": "assistant", "content": answer})
 
     # Save to cache
     save_to_cache(prompt, request.action, answer, request.history, cleaned_text)
@@ -764,14 +961,24 @@ async def explain_stream(
     print(f"[DEBUG /explain-stream] cleaned_text_len={len(cleaned_text)}")
     print(f"[DEBUG /explain-stream] history_len={len(request.history)}")
 
-    # Use cleaned_text (cached page content) as system_context for the prompt.
-    # Frontend's system_context is ignored in favor of server-cached content.
-    prompt = build_conversation_prompt(
-        system_context=cleaned_text,
-        history=request.history,
-        question=request.question or "",
-        base_template=ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]),
-    )
+    # Phase 3: Use ConversationContext for context window management
+    conversation_id = request.conversation_id or "default"
+    context = get_or_create_conversation(conversation_id, cleaned_text, request.title or "")
+
+    # Sync messages from frontend (they're the source of truth for the conversation)
+    if request.history:
+        context.messages = request.history
+
+    # Add current user question to context
+    if request.question:
+        context.messages.append({"role": "user", "content": request.question})
+
+    # Check if summarization is needed
+    await check_and_summarize(context)
+
+    # Build prompt using context window manager
+    prompt = context.get_context_window(request.question or "")
+    prompt = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]).format(text=prompt)
 
     # Check cache (key includes history + system_context so different
     # conversations / different pages don't collide)
@@ -801,6 +1008,9 @@ async def explain_stream(
             # transparently retrying/falling back.
             full_response = await _call_groq_with_fallback(prompt)
             save_to_cache(prompt, request.action, full_response, request.history, cleaned_text)
+
+            # Add assistant response to context
+            context.messages.append({"role": "assistant", "content": full_response})
 
             # Stream it in word chunks (like Claude)
             for chunk in chunk_preserving_whitespace(full_response, 15):
