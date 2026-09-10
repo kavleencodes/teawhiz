@@ -572,6 +572,246 @@ def get_or_create_conversation(conversation_id: str, page_context: str, title: s
 
 ---
 
+---
+
+## Phase 3 — Context Window Management
+
+### Goal
+Manage the context window so it doesn't grow unbounded. Implement:
+- Recent messages (last N turns)
+- Conversation summary (when history exceeds window)
+- Page context (always included, but truncated if too large)
+
+### Context Window Budget
+
+Groq's context window for `openai/gpt-oss-120b` is large (~128K tokens), but the free tier enforces an **8K tokens-per-minute per-request rate limit**. We budget against that practical ceiling, not the nominal window.
+
+**APPLICATION INPUT BUDGET** (hard cap: ~8,000 tokens = ~32,000 chars):
+| Component | Budget (tokens) | Budget (chars) | Notes |
+|-----------|-----------------|----------------|-------|
+| System instructions | ~100 | ~400 | Minimal prompt framing |
+| Page context (truncated) | ~2,000 | ~8,000 | Capped at first ~2000 words |
+| Recent messages | ~3,000 | ~12,000 | Last 5-8 turns (~500 tokens each) |
+| Summary | ~500 | ~2,000 | When conversation is long |
+| Current question | ~200 | ~800 | User's current input |
+| **Total** | **~5,800** | **~23,200** | Leaves ~2,200 tokens headroom |
+
+**OUTPUT BUDGET** (separate):
+| Component | Budget (tokens) |
+|-----------|-----------------|
+| MAX_OUTPUT_TOKENS | ~1,000 |
+
+The context manager enforces `input_tokens + MAX_OUTPUT_TOKENS <= APPLICATION_INPUT_BUDGET` (≈8K), not the model's 128K nominal window.
+
+> Note: The `4 chars ≈ 1 token` approximation is acceptable for Phase 3. Production should use proper token counting.
+
+### Implementation
+
+#### Backend — Context Manager
+
+```python
+from dataclasses import dataclass, field
+from typing import Optional, List
+
+@dataclass
+class ConversationContext:
+    conversation_id: str
+    page_context: str           # full extracted page text (cached)
+    title: str = ""
+    messages: List[dict] = field(default_factory=list)  # [{"role": ..., "content": ...}]
+    summary: Optional[str] = None  # "So far we've discussed X and Y..."
+
+    # Token budget constants (char-based for now, ~4 chars/token)
+    MODEL_CONTEXT_WINDOW = 128_000
+    APPLICATION_INPUT_BUDGET = 8_000   # tokens (free-tier TPM limit)
+    MAX_OUTPUT_TOKENS = 1_024
+    CHARS_PER_TOKEN = 4
+
+    # Derived budgets
+    INPUT_CHAR_BUDGET = (APPLICATION_INPUT_BUDGET - MAX_OUTPUT_TOKENS) * CHARS_PER_TOKEN  # ~28,000 chars
+    PAGE_CONTEXT_MAX_WORDS = 2000
+    PAGE_CONTEXT_MAX_CHARS = 8_000  # hard cap on page context section
+
+    def get_effective_page_context(self) -> str:
+        """Returns the page context as it will actually appear in the prompt (truncated)."""
+        page_words = self.page_context.split()[:self.PAGE_CONTEXT_MAX_WORDS]
+        page_text = " ".join(page_words)
+        page_section = f"Page Title: {self.title or 'Unknown'}\n\nPage Content:\n{page_text}"
+        if len(page_section) > self.PAGE_CONTEXT_MAX_CHARS:
+            keep_chars = self.PAGE_CONTEXT_MAX_CHARS - len("Page Title: \n\nPage Content:\n")
+            page_text = page_text[:keep_chars]
+            page_section = f"Page Title: {self.title or 'Unknown'}\n\nPage Content:\n{page_text}"
+        return page_section
+
+    def get_context_window(self, question: str) -> str:
+        """
+        Build a context-aware prompt within token budget.
+        Strategy:
+          1. Always include page context (truncated to effective size)
+          2. Include summary (if any) as bridge between older messages and recent ones
+          3. Include recent messages (as many as fit)
+          4. Include current question
+        """
+        remaining = self.INPUT_CHAR_BUDGET
+        parts: List[str] = []
+
+        # 1. Page context (highest priority, use effective/truncated version)
+        page_section = self.get_effective_page_context()
+        parts.append(page_section)
+        remaining -= len(page_section)
+
+        # 2. Summary (if conversation is long)
+        if self.summary:
+            summary_section = f"\n[Earlier in this conversation: {self.summary}]\n"
+            if len(summary_section) < remaining:
+                parts.append(summary_section)
+                remaining -= len(summary_section)
+
+        # 3. Recent messages (fit as many as possible)
+        recent_section = self._build_recent_section(remaining)
+        parts.append(recent_section)
+        remaining -= len(recent_section)
+
+        # 4. Current question
+        question_section = f"\nUser Question: {question}"
+        parts.append(question_section)
+
+        return "\n\n---\n\n".join(parts)
+
+    def _build_recent_section(self, char_budget: int) -> str:
+        """Build recent messages section fitting within budget.
+        
+        Returns the last N *messages* (not turns) that fit, where a message
+        is a single user or assistant entry. This keeps "recent history"
+        defined consistently as message count.
+        """
+        lines: List[str] = []
+        used_chars = 0
+
+        # Iterate backwards through messages (most recent first)
+        for msg in reversed(self.messages):
+            line = f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+            if used_chars + len(line) + 2 > char_budget:
+                break
+            lines.insert(0, line)  # prepend to maintain chronological order
+            used_chars += len(line) + 1
+
+        return "\n".join(lines) if lines else ""
+
+    def should_summarize(self) -> bool:
+        """
+        Summarize when estimated context size exceeds threshold.
+        Uses the *effective* (truncated) page context size, not the raw page size.
+        """
+        # Estimate tokens using effective page context + messages + summary + question buffer
+        effective_page = self.get_effective_page_context()
+        estimated_chars = (
+            len(effective_page) +
+            sum(len(m['content']) for m in self.messages) +
+            len(self.summary or "") +
+            500  # buffer for question + prompt overhead
+        )
+        estimated_tokens = estimated_chars / self.CHARS_PER_TOKEN
+        # Trigger when we'd exceed ~75% of input budget
+        return estimated_tokens > (self.APPLICATION_INPUT_BUDGET - self.MAX_OUTPUT_TOKENS) * 0.75
+
+    def update_summary(self, summary: str):
+        self.summary = summary
+```
+
+#### Backend — Auto-summarize Trigger (carries forward previous summary)
+
+```python
+async def check_and_summarize(context: ConversationContext) -> Optional[str]:
+    """If context size exceeds threshold, summarize older messages via LLM."""
+    if not context.should_summarize():
+        return None
+
+    # Build condensed history for summary
+    # Keep last 5 messages as "recent" (they're still fresh in context)
+    old_messages = context.messages[:-5]
+    if not old_messages:
+        return None
+
+    # Limit history for summary to ~15000 chars (~3750 tokens) to fit within model limits
+    max_summary_history_chars = 15000
+    history_for_summary = ""
+    for m in reversed(old_messages):
+        line = f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+        if len(history_for_summary) + len(line) > max_summary_history_chars:
+            break
+        history_for_summary = line + "\n" + history_for_summary  # prepend to maintain chronological order
+
+    if not history_for_summary:
+        return None
+
+    # Include previous summary as context so the new summary builds on it
+    previous_summary = f"\n\nPrevious summary: {context.summary}\n" if context.summary else ""
+
+    summary_prompt = (
+        "Summarize this conversation briefly, capturing the key topics and questions discussed. "
+        "Return a 2-3 sentence summary in the style: 'In this conversation we discussed X, Y, and Z.'"
+        f"{previous_summary}\n\n"
+        f"{history_for_summary}"
+    )
+
+    try:
+        summary = await _call_groq_with_fallback(summary_prompt)
+        context.update_summary(summary)
+        # Trim old messages we just summarized (keep last 5)
+        context.messages = context.messages[-5:]
+        print(f"[Context] Generated summary for conversation {context.conversation_id[:8]}...")
+        return summary
+    except Exception as e:
+        print(f"⚠️ Summary generation failed: {e}")
+        return None
+```
+
+#### Update `build_prompt` to use context manager
+
+```python
+def build_prompt(context: ConversationContext, question: str, action: str) -> str:
+    context_text = context.get_context_window(question)
+
+    action_templates = {
+        "explain": "Analyze and explain the following webpage content in clear, concise terms:\n\n{context}",
+        "simplify": "Rewrite the following in simpler language:\n\n{context}",
+        "summarize": "Provide a 2-3 sentence summary:\n\n{context}",
+        "translate": "Translate to Hindi:\n\n{context}",
+    }
+
+    template = action_templates.get(action, action_templates["explain"])
+    return template.format(context=context_text)
+```
+
+### Per-Conversation In-Memory Store
+
+```python
+# Simple in-memory store for active conversations
+# Phase 4 replaces this with PostgreSQL
+_active_conversations: dict[str, ConversationContext] = {}
+
+def get_or_create_conversation(conversation_id: str, page_context: str, title: str = "") -> ConversationContext:
+    if conversation_id not in _active_conversations:
+        _active_conversations[conversation_id] = ConversationContext(
+            conversation_id=conversation_id,
+            page_context=page_context,
+            title=title,
+        )
+    return _active_conversations[conversation_id]
+```
+
+### Verification Checklist
+- [x] Context window budget: input tokens + MAX_OUTPUT_TOKENS <= APPLICATION_INPUT_BUDGET (~8K)
+- [x] Very long page: truncated to ~2000 words / 8000 chars, doesn't overflow context
+- [x] Context manager enforces truncation and respects output budget
+- [x] LLM answers reference summarized history correctly
+- [x] Summary trigger based on effective context size (~75% of input budget), not raw page size
+- [x] New summary incorporates previous summary (carries forward context)
+- [x] Recent history defined consistently as *messages* (not turns)
+
+---
+
 ## Phase 4 — Persistent Storage
 
 ### Goal
@@ -1033,7 +1273,7 @@ async def build_context_with_memory(
 
 ## Migration Path
 
-### Phase 1-3: In-Memory (no new dependencies)
+### Phase 1-3: In-Memory (no new dependencies) ✅ COMPLETE
 - Start with in-memory conversation store
 - No DB, no Redis
 - Works on single-instance deployment
@@ -1098,17 +1338,17 @@ git checkout <previous-commit>
 ## Implementation Order
 
 ```
-Week 1-2: Phase 1 — Conversation state (frontend + backend)
+Week 1-2: Phase 1 — Conversation state (frontend + backend) ✅
            - Add history to requests
            - Build prompt with conversation context
            - Persist in chrome.storage.local
 
-Week 3-4: Phase 2 — Page context caching
+Week 3-4: Phase 2 — Page context caching ✅
            - Extract once, reuse for conversation
            - Add X-Page-Context-Hash header
            - Backend page context cache
 
-Week 5-6: Phase 3 — Context window management
+Week 5-6: Phase 3 — Context window management ✅
            - Implement ConversationContext class
            - Add summarization trigger
            - Token budget enforcement
@@ -1153,10 +1393,10 @@ curl -X POST http://localhost:8000/explain-stream \
 ```
 
 ### Manual QA Checklist
-- [ ] Phase 1: Multi-turn conversation on same page
-- [ ] Phase 1: Follow-up referencing previous answer
-- [ ] Phase 2: Cache hit logged on second request
-- [ ] Phase 3: 10+ turn conversation triggers summary
+- [x] Phase 1: Multi-turn conversation on same page
+- [x] Phase 1: Follow-up referencing previous answer
+- [x] Phase 2: Cache hit logged on second request
+- [x] Phase 3: 10+ turn conversation triggers summary
 - [ ] Phase 4: Conversation survives server restart
 - [ ] Phase 5: Semantic search retrieves relevant past conversation
 
@@ -1222,5 +1462,5 @@ curl -X POST http://localhost:8000/explain-stream \
 
 ---
 
-**Last Updated:** September 6, 2026
-**Status:** Phase 2 (page context caching) implemented and committed. Ready to begin Phase 1 (conversation state).
+**Last Updated:** September 9, 2026
+**Status:** Phase 3 (context window management with auto-summarization) implemented and tested. Ready to begin Phase 4 (PostgreSQL persistence).
