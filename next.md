@@ -225,10 +225,21 @@ chrome.runtime.sendMessage({
 ## Phase 2 — Cache Extracted Page Content
 
 ### Goal
-Trafilatura runs **once per page**, not once per question. Page context is extracted once, stored, and reused for all questions in the conversation.
+Trafilatura runs **once per cached page context**, not once per question. Page context is extracted once, stored in both backend memory cache and `chrome.storage.local`, and reused for all questions in the conversation.
+
+The backend cache (`_page_context_cache`) is in-memory and survives only while the server runs. A backend restart, cache eviction (1000 entries), or 7-day TTL expiry causes a cache miss — Trafilatura runs again, but the page context is still available in `chrome.storage.local` so the frontend doesn't need to re-capture the DOM.
 
 ### Why This Matters
 Today: every `/explain-stream` call runs Trafilatura on the full HTML. For a user asking 5 follow-up questions, that's 5 identical extractions. Caching page content eliminates that waste and reduces latency.
+
+**Cache behavior:**
+| Scenario | Backend cache | Frontend storage | Trafilatura runs? |
+|----------|---------------|------------------|-------------------|
+| First question | MISS | empty | ✅ Yes |
+| Follow-up questions | HIT | populated | ❌ No |
+| Backend restart | MISS (lost) | populated | ✅ Yes (but no DOM re-capture) |
+| Cache eviction / TTL expiry | MISS | populated | ✅ Yes |
+| New page | MISS | empty (new key) | ✅ Yes |
 
 ### What Changes
 
@@ -330,14 +341,15 @@ async function loadConversation() {
 // so the frontend can cache it for the conversation lifetime
 ```
 
-**Alternative (simpler):** Backend returns `page_context` in a `X-Page-Context-Hash` response header. Frontend stores `{ pageId, pageContext, pageContextHash }`. Subsequent requests send `page_context_hash` — if backend sees a hit, it skips extraction and uses cached context.
+**Alternative (simpler):** Backend returns `page_context` in a `X-Page-Context-Hash` response header. Frontend stores `{ pageId, pageContext, pageContextHash }`. Subsequent requests send `page_context_hash` — if backend sees a hit, it skips extraction and uses cached context. On backend restart, the hash is still sent; backend re-extracts but frontend doesn't re-capture DOM.
 
 ### Verification Checklist
-- [ ] First question on a page: extraction happens (see backend log)
-- [ ] Second question on same page: cache hit, no extraction (see backend log)
-- [ ] Different page: new extraction
-- [ ] Page context cache TTL works (7 days default)
-- [ ] Cache eviction when hitting MAX_PAGE_CONTEXT_ENTRIES
+- [x] First question on a page: extraction happens (see backend log)
+- [x] Second question on same page: cache hit, no extraction (see backend log)
+- [x] Different page: new extraction
+- [x] Page context cache TTL works (7 days default)
+- [x] Cache eviction when hitting MAX_PAGE_CONTEXT_ENTRIES
+- [x] Backend restart: Trafilatura runs again, but frontend uses stored context (no DOM re-capture)
 
 ---
 
@@ -1404,9 +1416,11 @@ curl -X POST http://localhost:8000/explain-stream \
 
 ---
 
- "changing the arch to extract the DOM once and storing once only"
+  "changing the arch to extract the DOM once and storing once only"
 
 **Goal:** Capture page content once when a page opens (via `CAPTURE_PAGE` message from content script → `/extract-context` backend endpoint), store in `chrome.storage.local`, and reuse for multiple questions in the popup — avoiding re-capture on each popup open.
+
+**Cache behavior:** The backend's in-memory `_page_context_cache` (1000 entries, 7-day TTL) avoids Trafilatura re-extraction on follow-up questions. On backend restart / cache eviction / TTL expiry, Trafilatura runs again, but the extracted content persists in `chrome.storage.local` so the frontend never re-captures the DOM.
 
 #### Backend (`backend/main.py`)
 
