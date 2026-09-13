@@ -912,13 +912,6 @@ async def explain(
     await check_and_summarize(context)
 
     # Build prompt using context window manager
-    prompt = build_conversation_prompt(
-        system_context="",  # Not used - context manager handles page context
-        history=[],  # Not used - context manager handles recent messages
-        question=request.question or "",
-        base_template=ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]),
-    )
-    # Override with context-aware prompt
     prompt = context.get_context_window(request.question or "")
     prompt = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]).format(text=prompt)
 
