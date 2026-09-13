@@ -196,15 +196,20 @@ response_cache: dict[str, dict] = {}
 # Cache version - bump when prompt structure changes so old cached answers
 # (from before history/system_context existed) don't get reused under a new
 # cache-key shape. Phase 1 introduction of conversation history = v2.
-CACHE_VERSION = "v2"
+CACHE_VERSION = "v3"  # v3: cache key now uses the final prompt sent to LLM
 
-def get_cache_key(text: str, action: str, history: list[dict] = None, system_context: str = "") -> str:
+def get_cache_key(prompt: str, action: str) -> str:
+    """Generate cache key from the exact prompt sent to the LLM.
+    
+    This ensures cache hits only when the complete prompt (including
+    truncated page context, summary, windowed recent messages, and question)
+    is identical - preventing collisions between conversations with same
+    raw content but different summaries/windowed history.
+    """
     parts = [
         CACHE_VERSION,
         action,
-        (system_context or "").strip(),
-        json.dumps(history or [], sort_keys=True),
-        text.strip(),
+        prompt.strip(),
     ]
     return hashlib.sha256(":".join(parts).encode()).hexdigest()
 
@@ -215,8 +220,8 @@ def is_cache_valid(timestamp_iso: str, days: int = 7) -> bool:
     except Exception:
         return False
 
-def get_from_cache(text: str, action: str, history: list[dict] = None, system_context: str = ""):
-    key = get_cache_key(text, action, history, system_context)
+def get_from_cache(prompt: str, action: str):
+    key = get_cache_key(prompt, action)
     if key in response_cache:
         entry = response_cache[key]
         if is_cache_valid(entry["timestamp"]):
@@ -224,14 +229,14 @@ def get_from_cache(text: str, action: str, history: list[dict] = None, system_co
         del response_cache[key]
     return None, False
 
-def save_to_cache(text: str, action: str, answer: str, history: list[dict] = None, system_context: str = ""):
+def save_to_cache(prompt: str, action: str, answer: str):
     if len(response_cache) >= MAX_CACHE_ENTRIES:
         # Evict oldest 10% entries if cache is full
         keys_to_remove = list(response_cache.keys())[:500]
         for k in keys_to_remove:
             response_cache.pop(k, None)
 
-    key = get_cache_key(text, action, history, system_context)
+    key = get_cache_key(prompt, action)
     response_cache[key] = {
         "answer": answer,
         "timestamp": datetime.now(timezone.utc).isoformat()
@@ -915,9 +920,8 @@ async def explain(
     prompt = context.get_context_window(request.question or "")
     prompt = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]).format(text=prompt)
 
-    # Check cache (key includes history + system_context so different
-    # conversations / different pages don't collide)
-    cached_answer, from_cache = get_from_cache(prompt, request.action, request.history, cleaned_text)
+    # Check cache (key is the exact prompt sent to LLM)
+    cached_answer, from_cache = get_from_cache(prompt, request.action)
     if from_cache:
         return ExplainResponse(answer=cached_answer, cached=True)
 
@@ -928,7 +932,7 @@ async def explain(
     context.messages.append({"role": "assistant", "content": answer})
 
     # Save to cache
-    save_to_cache(prompt, request.action, answer, request.history, cleaned_text)
+    save_to_cache(prompt, request.action, answer)
 
     return ExplainResponse(answer=answer, cached=False)
 
@@ -973,9 +977,8 @@ async def explain_stream(
     prompt = context.get_context_window(request.question or "")
     prompt = ACTION_PROMPTS.get(request.action, ACTION_PROMPTS["explain"]).format(text=prompt)
 
-    # Check cache (key includes history + system_context so different
-    # conversations / different pages don't collide)
-    cached_answer, from_cache = get_from_cache(prompt, request.action, request.history, cleaned_text)
+    # Check cache (key is the exact prompt sent to LLM)
+    cached_answer, from_cache = get_from_cache(prompt, request.action)
     if from_cache:
         # Stream cached response in word chunks (like Claude)
         async def stream_cached():
@@ -1000,7 +1003,7 @@ async def explain_stream(
             # being unavailable) fails the whole streamed answer instead of
             # transparently retrying/falling back.
             full_response = await _call_groq_with_fallback(prompt)
-            save_to_cache(prompt, request.action, full_response, request.history, cleaned_text)
+            save_to_cache(prompt, request.action, full_response)
 
             # Add assistant response to context
             context.messages.append({"role": "assistant", "content": full_response})
